@@ -142,7 +142,7 @@ export const DEFAULT_STYLE: GraphStyle = {
   agentRings: {
     show: true,
     color: "warning",
-    width: 2,
+    width: 4,
     innerScale: 1.35,
     spacing: 0.3,
     rotateDegPerSec: 45,
@@ -304,7 +304,7 @@ export class StyleResolver {
     return {
       show: r.show ?? true,
       color: r.color ?? "warning",
-      width: r.width ?? 2,
+      width: r.width ?? 4,
       innerScale: r.innerScale ?? 1.35,
       spacing: r.spacing ?? 0.3,
       rotateDegPerSec: r.rotateDegPerSec ?? 45,
