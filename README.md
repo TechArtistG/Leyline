@@ -32,15 +32,17 @@ Paseo already manages daemons, workspaces (one worktree each), agents, terminals
 | PR / GitHub tasks | Nodes for PRs, issues, checks | Follow-up feature |
 | Rendering | 2D + 3D force-directed, one data model; VR later | See [Graph component evaluation](#graph-component-evaluation) |
 
-Leyline **observes and brokers**; it does not launch OMP itself. Agents stay owned by Paseo.
+Leyline **observes and brokers**; it does not launch agents itself. Agents stay owned by Paseo.
+
+**Provider dependency.** Paseo has no hard dependency on OMP; it also drives Claude, Codex, Copilot, OpenCode and Pi. Leyline consumes Paseo's provider-normalised surfaces (`agents.list`, timeline `tool_call` items, `provider_subagents` events, hooks) and is therefore provider-agnostic by default. A hard OMP dependency is acceptable where an OMP feature is genuinely invaluable; none has been identified yet — the candidates (subagent trees, worktree isolation, `AGENTS.md`/`RULES.md` conventions) are all reachable through Paseo or the filesystem.
 
 ## Technology stack
 
 | Layer | Choice | Notes |
 |---|---|---|
 | Host | Paseo plugin API (`@getpaseo/plugin`) | Experimental API; panels need Paseo ≥ 0.13, hooks ≥ 0.14. Developed against 0.15.2. |
-| Agent engine | OMP (oh-my-pi) | Paseo ships a native OMP provider (`omp --mode rpc-ui`, JSONL over stdio). Developed against omp 18.16.0; Paseo requires ≥ 16.3.9. |
-| Renderer | **Undecided** — three.js DIY vs `react-force-graph` vs `reagraph` | Evaluated below; needs a bundling spike |
+| Agent engine | Provider-agnostic via Paseo; OMP (oh-my-pi) is the primary target | Paseo ships a native OMP provider (`omp --mode rpc-ui`, JSONL over stdio). Developed against omp 18.16.0; Paseo requires ≥ 16.3.9. |
+| Renderer | **three.js** (imperative, `import("three")` behind the web gate) — [ADR-001](docs/ADR-001-renderer.md) | Spike verified: three r187 renders WebGL 2.0 inside a Paseo 0.15.2 panel on Electron |
 | Physics | `d3-force-3d` (1D/2D/3D from one simulation) | Common to all three candidates |
 | Styling | Paseo `PluginTheme` tokens + injected CSS | Dark-mode first, neon/cyan to match the Leyline logo |
 | Language | TypeScript, React (React Native Web on desktop) | Node 22 / npm |
@@ -185,9 +187,9 @@ interface GraphRenderer {
 ### Phase 1: Foundation & renderer spike
 - [x] Investigate Paseo plugin API, OMP integration surfaces, hub-level data, graph libraries
 - [x] Repository scaffolding: README, `.gitignore`, MIT license
-- [ ] `paseo plugin init`; sidebar header item + hub screen + workspace panel registered
-- [ ] **Bundling spike**: load `three` + `d3-force-3d` (and `react-force-graph-3d` for comparison) behind the web gate inside a Paseo panel; confirm WebGL mount, resize, DPR, CSS injection
-- [ ] Decide renderer; record in `docs/ADR-001-renderer.md`
+- [x] `paseo plugin init`; sidebar header item + hub screen + workspace panel registered
+- [x] **Bundling spike**: three.js scene mounted in a Paseo workspace panel; WebGL 2.0, resize, `three/addons` subpath export verified. `require("three")` fails (`process.emitWarning`), dynamic `import()` works
+- [x] Decide renderer: three.js DIY — [ADR-001](docs/ADR-001-renderer.md)
 - [ ] Mock topology fixtures (hosts, repos, worktrees, agents, subagents) rendered in 2D and 3D
 - [ ] Leyline logo (directed "L") as the sidebar item and panel icon
 
@@ -210,12 +212,11 @@ interface GraphRenderer {
 
 ### Later
 - [ ] PR / issue / checks nodes from `githubRuntime`
-- [ ] VR mode: serve the renderer to a WebXR browser; `@react-three/xr` or `VRButton`
+- [ ] VR mode (aspirational): serve the renderer to a WebXR browser; `@react-three/xr` or `VRButton`
 
 ## Open questions
 
-- **Bundler tolerance** for `three` (ESM `"type": "module"`, `./addons/*` subpath exports) and `three-forcegraph` side effects under Paseo's plugin compiler — Phase 1 spike.
-- **Host React version** — `@react-three/fiber` 9 requires React 19 `[INFERENCE]`; determines r3f vs imperative three.
+- **`three-forcegraph` / `d3-force-3d`** under Paseo's bundler — three itself is verified; these two are not yet.
 - **Plain-browser URL for a panel** (needed for the VR path) — not found in docs.
 - **Missing host APIs** (candidate feature requests): checkout status / commits / diff / merge / push and `listProviderSubagents` exist on `DaemonClient` but not `PaseoApi`; no merge-base / branch-graph API; no "open Diff tab" navigation; no steer/interrupt; `useWorkspace`/`useAgent` unusable in screens; `agent.turn.before` cannot inject context.
 - **Paseo license** is a custom text (not MIT/Apache); confirm redistribution terms before publishing to the Paseo plugin registry.
