@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { Connector } from "./connector";
 import type { GraphNode } from "./node";
-import type { ColorRef, ConnectorVisual, LabelSettings, NodeVisual } from "./visual";
+import type { AgentRingVisual, ColorRef, ConnectorVisual, LabelSettings, NodeVisual } from "./visual";
 import type { ConnectorKind, NodeKind } from "./wire";
 
 /**
@@ -46,6 +46,8 @@ const NodeRule = NodeStyle.extend({
 const ConnectorStyle = z.object({
   color: ColorRefSchema.optional(),
   opacity: z.number().min(0).max(1).optional(),
+  /** Screen-space line width in px. */
+  width: z.number().positive().optional(),
   dashed: z.boolean().optional(),
   directed: z.boolean().optional(),
 });
@@ -91,11 +93,40 @@ export const GraphStyle = z.object({
       padding: z.number().min(0).optional(),
     })
     .optional(),
+  /** How the selected node's connectors differ from the default look. */
+  selection: z
+    .object({
+      /** Multiplier on the connector's `width`. */
+      widthScale: z.number().positive().optional(),
+      /** 0..1 mix of the connector colour toward `foreground`. */
+      lighten: z.number().min(0).max(1).optional(),
+    })
+    .optional(),
+  /**
+   * Rings drawn around a worktree for each agent anchored to it; concentric when several.
+   * An agent in `executing` state gets a dashed ring that rotates.
+   */
+  agentRings: z
+    .object({
+      show: z.boolean().optional(),
+      color: ColorRefSchema.optional(),
+      /** Screen-space ring line width in px. */
+      width: z.number().positive().optional(),
+      /** First ring radius as a multiple of the node radius. */
+      innerScale: z.number().positive().optional(),
+      /** World-unit gap between concentric rings. */
+      spacing: z.number().positive().optional(),
+      /** Degrees per second for active (dashed) rings. */
+      rotateDegPerSec: z.number().optional(),
+    })
+    .optional(),
 });
 export type GraphStyle = z.infer<typeof GraphStyle>;
 
 export const DEFAULT_STYLE: GraphStyle = {
   clusters: { show: true, color: "border", opacity: 0.25, padding: 2 },
+  selection: { widthScale: 2, lighten: 0.45 },
+  agentRings: { show: true, color: "warning", width: 2, innerScale: 1.35, spacing: 0.3, rotateDegPerSec: 45 },
   nodes: {
     universe: { color: "border", emissive: 0.2, labelAlways: true, labelTier: "project" },
     host: { color: "muted", labelAlways: true, labelTier: "project" },
@@ -141,17 +172,18 @@ export const DEFAULT_STYLE: GraphStyle = {
     },
   },
   connectors: {
-    contains: { color: "border", opacity: 0.5 },
-    "branch-of": { color: "border", opacity: 0.4, dashed: true },
-    spawned: { color: "accent", opacity: 0.6, directed: true },
-    touches: { color: "muted", opacity: 0.4, states: { write: { color: "warning" }, edit: { color: "warning" } } },
+    contains: { color: "muted", opacity: 0.85, width: 1.5 },
+    "branch-of": { color: "muted", opacity: 0.7, width: 1.25, dashed: true },
+    spawned: { color: "accent", opacity: 0.9, width: 1.5, directed: true },
+    touches: { color: "muted", opacity: 0.7, width: 1.25, states: { write: { color: "warning" }, edit: { color: "warning" } } },
     "merges-into": {
       color: "success",
-      opacity: 0.9,
+      opacity: 1,
+      width: 2,
       directed: true,
       states: { stale: { color: "warning" }, conflicts: { color: "danger" }, unknown: { color: "muted" } },
     },
-    "shares-context": { color: "accent", opacity: 0.9, dashed: true },
+    "shares-context": { color: "accent", opacity: 1, width: 2, dashed: true },
   },
   labels: {
     fontSizePx: 13,
@@ -198,6 +230,7 @@ export class StyleResolver {
     return {
       color: merged.color ?? "border",
       opacity: merged.opacity ?? 0.5,
+      width: merged.width ?? 1.5,
       dashed: merged.dashed ?? false,
       directed: merged.directed ?? false,
     };
@@ -221,5 +254,22 @@ export class StyleResolver {
   clusterVisual(): { show: boolean; color: ColorRef; opacity: number; padding: number } {
     const c = { ...DEFAULT_STYLE.clusters, ...this.style.clusters };
     return { show: c.show ?? true, color: c.color ?? "border", opacity: c.opacity ?? 0.25, padding: c.padding ?? 2 };
+  }
+
+  selectionVisual(): { widthScale: number; lighten: number } {
+    const s = { ...DEFAULT_STYLE.selection, ...this.style.selection };
+    return { widthScale: s.widthScale ?? 2, lighten: s.lighten ?? 0.45 };
+  }
+
+  agentRingVisual(): AgentRingVisual {
+    const r = { ...DEFAULT_STYLE.agentRings, ...this.style.agentRings };
+    return {
+      show: r.show ?? true,
+      color: r.color ?? "warning",
+      width: r.width ?? 2,
+      innerScale: r.innerScale ?? 1.35,
+      spacing: r.spacing ?? 0.3,
+      rotateDegPerSec: r.rotateDegPerSec ?? 45,
+    };
   }
 }

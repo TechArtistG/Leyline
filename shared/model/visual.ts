@@ -23,6 +23,8 @@ export interface NodeVisual {
 }
 
 export interface ConnectorVisual {
+  /** Screen-space line width in px. */
+  width: number;
   color: ColorRef;
   /** 0..1. */
   opacity: number;
@@ -45,4 +47,14 @@ export interface LabelSettings {
   allAbovePxPerUnit: number;
   /** Pixels per world unit at which labels are exactly `fontSizePx`. */
   referencePxPerUnit: number;
+}
+
+/** Rings around a worktree, one per anchored agent; dashed + rotating while that agent executes. */
+export interface AgentRingVisual {
+  show: boolean;
+  color: ColorRef;
+  width: number;
+  innerScale: number;
+  spacing: number;
+  rotateDegPerSec: number;
 }

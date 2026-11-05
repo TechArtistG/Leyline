@@ -2,12 +2,25 @@ import type { PluginTheme } from "@getpaseo/plugin";
 import type * as D3 from "d3-force-3d";
 import type * as Three from "three";
 import type * as OrbitControlsModule from "three/addons/controls/OrbitControls.js";
+import type * as Line2Module from "three/addons/lines/Line2.js";
+import type * as LineGeometryModule from "three/addons/lines/LineGeometry.js";
+import type * as LineMaterialModule from "three/addons/lines/LineMaterial.js";
+import type * as LineSegments2Module from "three/addons/lines/LineSegments2.js";
+import type * as LineSegmentsGeometryModule from "three/addons/lines/LineSegmentsGeometry.js";
 import type { GraphEvent, GraphHandle, GraphMode } from "../../shared/graph";
 import type { Connector } from "../../shared/model/connector";
 import type { Graph, GraphChange } from "../../shared/model/graph";
 import type { GraphNode } from "../../shared/model/node";
+import { AgentNode } from "../../shared/model/nodes";
 import { type GraphStyle, StyleResolver } from "../../shared/model/style";
-import type { ColorRef, ColorRole, ConnectorVisual, LabelSettings, NodeVisual } from "../../shared/model/visual";
+import type {
+  AgentRingVisual,
+  ColorRef,
+  ColorRole,
+  ConnectorVisual,
+  LabelSettings,
+  NodeVisual,
+} from "../../shared/model/visual";
 import { type ConnectorKind, TREE_CONNECTOR_KINDS } from "../../shared/model/wire";
 import {
   type Cluster,
@@ -59,6 +72,11 @@ export interface RendererLibs {
   THREE: typeof Three;
   OrbitControls: typeof OrbitControlsModule.OrbitControls;
   d3: typeof D3;
+  LineSegments2: typeof LineSegments2Module.LineSegments2;
+  LineSegmentsGeometry: typeof LineSegmentsGeometryModule.LineSegmentsGeometry;
+  LineMaterial: typeof LineMaterialModule.LineMaterial;
+  Line2: typeof Line2Module.Line2;
+  LineGeometry: typeof LineGeometryModule.LineGeometry;
 }
 
 /**
@@ -135,13 +153,35 @@ interface ClusterDrawable {
   hull: Float32Array;
   positions: Float32Array;
 }
-/** One `LineSegments` draw: solid or dashed connectors, each with its own interleaved buffers. */
+/**
+ * One fat-line draw: every drawn connector sharing a `(width px, dashed)` key. Width is a material
+ * uniform, hence a batch key; the selected node's connectors (scaled width) land in their own batch.
+ * Buffers are instanced-interleaved views over the arrays here, updated in place each frame.
+ */
 interface LineBatch {
-  geometry: Three.BufferGeometry;
-  object: Three.LineSegments;
+  geometry: LineSegmentsGeometryModule.LineSegmentsGeometry;
+  material: LineMaterialModule.LineMaterial;
+  object: LineSegments2Module.LineSegments2;
   entries: ConnectorEntry[];
   positions: Float32Array;
   colors: Float32Array;
+  positionBuffer: Three.InterleavedBuffer;
+  colorBuffer: Three.InterleavedBuffer;
+  /** Dashed only: per-segment `(0, length)` pairs so each connector's dash pattern starts at its source. */
+  distances: Float32Array | null;
+  distanceBuffer: Three.InterleavedBuffer | null;
+}
+/** One concentric ring around a worktree for one anchored agent; dashed + spinning while that agent executes. */
+interface AgentRing {
+  agentId: string;
+  executing: boolean;
+  radius: number;
+  line: Line2Module.Line2;
+}
+/** All agent rings of one web node, in sorted agent id order (index = ring slot from the inside out). */
+interface AgentRingSet {
+  entry: NodeEntry;
+  rings: AgentRing[];
 }
 interface Point {
   x: number;
@@ -201,8 +241,14 @@ const RING_SCALE = 1.35;
 const RING_TUBE = 0.05;
 const CONE_HEIGHT = 0.7;
 const CONE_RADIUS = 0.28;
+/** Connector dash pattern, world units along the segment (fat-line dash distances are pre-projection). */
 const DASH_SIZE = 0.6;
 const GAP_SIZE = 0.4;
+/** Agent rings: polyline resolution, dash count per executing ring (dash and gap each 1/24 of the circumference). */
+const AGENT_RING_SEGMENTS = 64;
+const AGENT_RING_DASHES = 12;
+/** Rings draw after the connector batches (also transparent, order 0) so they are never cut by a line. */
+const AGENT_RING_RENDER_ORDER = 1;
 const SELECT_EMISSIVE = 0.5;
 const HOVER_EMISSIVE = 0.2;
 /** Spider ring radius = anchor radius + spider radius × this. */
@@ -239,7 +285,7 @@ export function createGraphRenderer(
   initialStyle: GraphStyle | undefined,
   libs: RendererLibs,
 ): GraphHandle {
-  const { THREE, OrbitControls, d3 } = libs;
+  const { THREE, OrbitControls, d3, LineSegments2, LineSegmentsGeometry, LineMaterial, Line2, LineGeometry } = libs;
 
   // ---- style / palette -----------------------------------------------------------------------
   let resolver = new StyleResolver(initialStyle);
@@ -247,6 +293,8 @@ export function createGraphRenderer(
   const foreground = new THREE.Color(theme.colors.foreground);
   /** Resolved `ColorRef` → colour; cleared when the style (and thus its palette) changes. */
   let colorCache = new Map<ColorRef, Three.Color>();
+  let selectionStyle = resolver.selectionVisual();
+  let agentRingStyle: AgentRingVisual = resolver.agentRingVisual();
 
   /** Role → `style.palette` override, else the theme colour; literal hex as-is (alpha digits dropped). */
   function colorFor(ref: ColorRef): Three.Color {
@@ -312,20 +360,131 @@ export function createGraphRenderer(
   const ringGeometry = new THREE.TorusGeometry(1, RING_TUBE, 8, 48);
   const coneGeometry = new THREE.ConeGeometry(CONE_RADIUS, CONE_HEIGHT, 12);
 
+  /**
+   * Fat-line helper: dash distances are a per-instance `(start, end)` pair that three's
+   * `computeLineDistances` reallocates on every call; attach a buffer we own instead so the
+   * frame loop can refresh it in place.
+   */
+  function attachLineDistances(
+    geometry: LineSegmentsGeometryModule.LineSegmentsGeometry,
+    distances: Float32Array,
+    usage: Three.Usage,
+  ): Three.InterleavedBuffer {
+    const buffer = new THREE.InstancedInterleavedBuffer(distances, 2, 1).setUsage(usage);
+    geometry.setAttribute("instanceDistanceStart", new THREE.InterleavedBufferAttribute(buffer, 1, 0));
+    geometry.setAttribute("instanceDistanceEnd", new THREE.InterleavedBufferAttribute(buffer, 1, 1));
+    return buffer;
+  }
+
   // Opacity per connector is pre-mixed into the vertex colours against the surface colour, so one
-  // opaque draw call per batch carries every opacity. Dashed connectors need a different material,
-  // hence a second batch; `computeLineDistances` runs on it every frame since endpoints move.
-  const solidMaterial = new THREE.LineBasicMaterial({ vertexColors: true });
-  const dashedMaterial = new THREE.LineDashedMaterial({ vertexColors: true, dashSize: DASH_SIZE, gapSize: GAP_SIZE });
-  function createBatch(material: Three.Material): LineBatch {
-    const geometry = new THREE.BufferGeometry();
-    const object = new THREE.LineSegments(geometry, material);
+  // draw call per batch carries every opacity. Width is a material uniform of the fat-line shader,
+  // so connectors are batched by `(width, dashed)`; the few distinct style widths keep this small.
+  const lineBatches = new Map<string, LineBatch>();
+  /** `lineBatches` values as an array for the frame loop. */
+  let lineBatchList: LineBatch[] = [];
+
+  function createLineMaterial(linewidth: number, dashed: boolean): LineMaterialModule.LineMaterial {
+    const material = new LineMaterial({
+      linewidth,
+      worldUnits: false,
+      vertexColors: true,
+      dashed,
+      dashSize: DASH_SIZE,
+      gapSize: GAP_SIZE,
+      transparent: true,
+      alphaToCoverage: true,
+      toneMapped: false,
+    });
+    material.resolution.set(width, height);
+    return material;
+  }
+
+  type LineBuffers = Pick<LineBatch, "positions" | "colors" | "positionBuffer" | "colorBuffer" | "distances" | "distanceBuffer">;
+
+  /** Attach `count` zeroed segments to a fresh geometry; the returned arrays are what the frame loop writes. */
+  function fillLineGeometry(geometry: LineSegmentsGeometryModule.LineSegmentsGeometry, dashed: boolean, count: number): LineBuffers {
+    const positions = new Float32Array(count * 6);
+    const colors = new Float32Array(count * 6);
+    // `setPositions`/`setColors` wrap a Float32Array without copying; keep the interleaved buffers to flag updates.
+    geometry.setPositions(positions);
+    geometry.setColors(colors);
+    const positionBuffer = (geometry.getAttribute("instanceStart") as Three.InterleavedBufferAttribute).data;
+    positionBuffer.setUsage(THREE.DynamicDrawUsage);
+    const colorBuffer = (geometry.getAttribute("instanceColorStart") as Three.InterleavedBufferAttribute).data;
+    const distances = dashed ? new Float32Array(count * 2) : null;
+    const distanceBuffer = distances ? attachLineDistances(geometry, distances, THREE.DynamicDrawUsage) : null;
+    return { positions, colors, positionBuffer, colorBuffer, distances, distanceBuffer };
+  }
+
+  function createLineBatch(linewidth: number, dashed: boolean, count: number): LineBatch {
+    const geometry = new LineSegmentsGeometry();
+    const material = createLineMaterial(linewidth, dashed);
+    const object = new LineSegments2(geometry, material);
     object.frustumCulled = false;
     scene.add(object);
-    return { geometry, object, entries: [], positions: new Float32Array(0), colors: new Float32Array(0) };
+    return { geometry, material, object, entries: [], ...fillLineGeometry(geometry, dashed, count) };
   }
-  const solid = createBatch(solidMaterial);
-  const dashed = createBatch(dashedMaterial);
+
+  /** Resize a batch to `count` segments: a fresh geometry releases the old GPU buffers with it. */
+  function resizeLineBatch(batch: LineBatch, count: number): void {
+    batch.geometry.dispose();
+    batch.geometry = new LineSegmentsGeometry();
+    batch.object.geometry = batch.geometry;
+    Object.assign(batch, fillLineGeometry(batch.geometry, batch.material.dashed, count));
+  }
+
+  function disposeLineBatch(batch: LineBatch): void {
+    scene.remove(batch.object);
+    batch.geometry.dispose();
+    batch.material.dispose();
+  }
+
+  // Agent rings: a unit circle polyline shared by every ring (scaled per ring; screen-space width is
+  // scale-independent) and two shared materials, solid and dashed. Dash distances are static in the
+  // geometry's unit space, so one dash/gap size tiles every ring regardless of radius.
+  const agentRingGeometry = new LineGeometry();
+  const agentRingChord = 2 * Math.sin(Math.PI / AGENT_RING_SEGMENTS);
+  const agentRingDash = (AGENT_RING_SEGMENTS * agentRingChord) / (AGENT_RING_DASHES * 2);
+  {
+    const points = new Float32Array((AGENT_RING_SEGMENTS + 1) * 3);
+    for (let i = 0; i <= AGENT_RING_SEGMENTS; i++) {
+      const angle = (i / AGENT_RING_SEGMENTS) * Math.PI * 2;
+      points[i * 3] = Math.cos(angle);
+      points[i * 3 + 1] = Math.sin(angle);
+    }
+    agentRingGeometry.setPositions(points);
+    const distances = new Float32Array(AGENT_RING_SEGMENTS * 2);
+    for (let i = 0; i < AGENT_RING_SEGMENTS; i++) {
+      distances[i * 2] = i * agentRingChord;
+      distances[i * 2 + 1] = (i + 1) * agentRingChord;
+    }
+    attachLineDistances(agentRingGeometry, distances, THREE.StaticDrawUsage);
+  }
+  function createAgentRingMaterial(dashed: boolean): LineMaterialModule.LineMaterial {
+    const material = new LineMaterial({
+      linewidth: agentRingStyle.width,
+      worldUnits: false,
+      dashed,
+      dashSize: agentRingDash,
+      gapSize: agentRingDash,
+      transparent: true,
+      alphaToCoverage: true,
+      depthTest: true,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    material.color.copy(colorFor(agentRingStyle.color));
+    material.resolution.set(width, height);
+    return material;
+  }
+  const agentRingSolidMaterial = createAgentRingMaterial(false);
+  const agentRingDashedMaterial = createAgentRingMaterial(true);
+  /** Web node id → its agent rings. */
+  const agentRingSets = new Map<string, AgentRingSet>();
+  /** Set by node restyles (agent state, anchor radius); cleared by `rebuildAgentRings`. */
+  let agentRingsDirty = false;
+  const agentRingSpin = new THREE.Quaternion();
+  const agentRingAxis = new THREE.Vector3(0, 0, 1);
 
   // ---- camera / controls ---------------------------------------------------------------------
   let mode: GraphMode = initialMode;
@@ -380,6 +539,11 @@ export function createGraphRenderer(
       camera.bottom = -h / 2;
       camera.updateProjectionMatrix();
     }
+    // Screen-space line widths are computed against the viewport; `LineSegments2.onBeforeRender`
+    // refreshes this too, but only for objects that render, so keep every material current.
+    for (const batch of lineBatchList) batch.material.resolution.set(w, h);
+    agentRingSolidMaterial.resolution.set(w, h);
+    agentRingDashedMaterial.resolution.set(w, h);
   }
   const resizeObserver = new ResizeObserver(([entry]) => {
     resize(Math.max(1, entry.contentRect.width), Math.max(1, entry.contentRect.height));
@@ -674,6 +838,7 @@ export function createGraphRenderer(
       list.push(e.node.id);
     }
     for (const list of anchoredBy.values()) list.sort();
+    rebuildAgentRings();
   }
 
   function spiderVisible(entry: NodeEntry, visible: boolean): void {
@@ -851,6 +1016,8 @@ export function createGraphRenderer(
     refreshRing(entry);
     refreshLabel(entry);
     if (entry.anchorId !== entry.node.anchorId) retargetSpider(entry, lastFrameTime);
+    // Agent state (dashed/spinning ring) and anchor radius (ring radii) both feed the agent rings.
+    agentRingsDirty = true;
     return flipped;
   }
 
@@ -924,13 +1091,22 @@ export function createGraphRenderer(
     entry.cone.material.color.copy(tmpMix);
   }
 
-  /** Returns true when the connector changed batch (solid ↔ dashed), which needs a buffer rebuild. */
+  /** Returns true when the connector changed batch key (width or dashed), which needs a buffer rebuild. */
   function restyleConnector(entry: ConnectorEntry): boolean {
     const previous = entry.visual;
     entry.visual = resolver.connectorVisual(entry.connector);
     entry.revision = entry.connector.revision;
     refreshCone(entry);
-    return previous.dashed !== entry.visual.dashed;
+    return previous.dashed !== entry.visual.dashed || previous.width !== entry.visual.width;
+  }
+
+  /** Incident to the selected node: drawn wider and lighter, in its own batch. */
+  function isSelectedConnector(entry: ConnectorEntry): boolean {
+    return selectedId !== null && (entry.link.source.id === selectedId || entry.link.target.id === selectedId);
+  }
+
+  function connectorWidth(entry: ConnectorEntry): number {
+    return entry.visual.width * (isSelectedConnector(entry) ? selectionStyle.widthScale : 1);
   }
 
   /** Hidden endpoints hide a connector entirely; shown web↔web links are simulated as well as drawn. */
@@ -965,30 +1141,44 @@ export function createGraphRenderer(
     }
   }
 
+  /**
+   * Regroup every drawn connector into its `(width, dashed)` batch and resize the batch buffers.
+   * Runs on structural/drawable changes, style changes and selection changes (the selected node's
+   * connectors change width, hence batch); batches left without members are disposed.
+   */
   function rebuildLineBuffers(): void {
-    solid.entries = [];
-    dashed.entries = [];
-    for (const e of connectorEntries.values()) if (e.drawn) (e.visual.dashed ? dashed : solid).entries.push(e);
-    for (const batch of [solid, dashed]) {
-      batch.positions = new Float32Array(batch.entries.length * 6);
-      batch.colors = new Float32Array(batch.entries.length * 6);
-      batch.geometry.setAttribute("position", new THREE.BufferAttribute(batch.positions, 3).setUsage(THREE.DynamicDrawUsage));
-      batch.geometry.setAttribute("color", new THREE.BufferAttribute(batch.colors, 3));
-      batch.object.visible = batch.entries.length > 0;
+    const grouped = new Map<string, ConnectorEntry[]>();
+    for (const e of connectorEntries.values()) {
+      if (!e.drawn) continue;
+      const key = `${connectorWidth(e)}|${e.visual.dashed ? "d" : "s"}`;
+      let list = grouped.get(key);
+      if (!list) grouped.set(key, (list = []));
+      list.push(e);
     }
+    for (const [key, batch] of lineBatches) {
+      if (grouped.has(key)) continue;
+      disposeLineBatch(batch);
+      lineBatches.delete(key);
+    }
+    for (const [key, list] of grouped) {
+      let batch = lineBatches.get(key);
+      if (batch) resizeLineBatch(batch, list.length);
+      else lineBatches.set(key, (batch = createLineBatch(connectorWidth(list[0]), list[0].visual.dashed, list.length)));
+      batch.entries = list;
+    }
+    lineBatchList = [...lineBatches.values()];
     refreshLineColors();
   }
 
   function refreshLineColors(): void {
-    for (const batch of [solid, dashed]) {
+    for (const batch of lineBatchList) {
       const { entries: list, colors } = batch;
       for (let i = 0; i < list.length; i++) {
-        const { link, visual } = list[i];
-        const direct = selectedId !== null && (link.source.id === selectedId || link.target.id === selectedId);
+        const { visual } = list[i];
         let opacity = visual.opacity;
         tmpColor.copy(colorFor(visual.color));
-        if (direct) {
-          tmpColor.lerp(foreground, 0.35);
+        if (isSelectedConnector(list[i])) {
+          tmpColor.lerp(foreground, selectionStyle.lighten);
           opacity = 1;
         }
         tmpMix.copy(surface).lerp(tmpColor, opacity);
@@ -997,29 +1187,138 @@ export function createGraphRenderer(
         colors[o + 1] = colors[o + 4] = tmpMix.g;
         colors[o + 2] = colors[o + 5] = tmpMix.b;
       }
-      const attr = batch.geometry.getAttribute("color");
-      if (attr) attr.needsUpdate = true;
+      batch.colorBuffer.needsUpdate = true;
     }
   }
 
+  /** Write endpoint positions (and, for dashed batches, segment lengths) into the instanced buffers in place. */
   function updateLinePositions(): void {
-    for (const batch of [solid, dashed]) {
-      const { entries: list, positions } = batch;
-      if (list.length === 0) continue;
+    for (const batch of lineBatchList) {
+      const { entries: list, positions, distances } = batch;
       for (let i = 0; i < list.length; i++) {
         const { source, target } = list[i].link;
         const o = i * 6;
-        positions[o] = source.x ?? 0;
-        positions[o + 1] = source.y ?? 0;
-        positions[o + 2] = source.z ?? 0;
-        positions[o + 3] = target.x ?? 0;
-        positions[o + 4] = target.y ?? 0;
-        positions[o + 5] = target.z ?? 0;
+        const sx = source.x ?? 0;
+        const sy = source.y ?? 0;
+        const sz = source.z ?? 0;
+        const tx = target.x ?? 0;
+        const ty = target.y ?? 0;
+        const tz = target.z ?? 0;
+        positions[o] = sx;
+        positions[o + 1] = sy;
+        positions[o + 2] = sz;
+        positions[o + 3] = tx;
+        positions[o + 4] = ty;
+        positions[o + 5] = tz;
+        if (distances) {
+          const dx = tx - sx;
+          const dy = ty - sy;
+          const dz = tz - sz;
+          distances[i * 2] = 0;
+          distances[i * 2 + 1] = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        }
       }
-      const attr = batch.geometry.getAttribute("position");
-      if (attr) attr.needsUpdate = true;
+      batch.positionBuffer.needsUpdate = true;
+      if (batch.distanceBuffer) batch.distanceBuffer.needsUpdate = true;
     }
-    if (dashed.entries.length > 0) dashed.object.computeLineDistances();
+  }
+
+  // ---- agent rings ---------------------------------------------------------------------------
+  function disposeAgentRingSet(set: AgentRingSet): void {
+    for (const ring of set.rings) scene.remove(ring.line);
+  }
+
+  /**
+   * Reconcile the ring sets with the anchored-spider index: one set per shown web node that has
+   * anchored `agent` spiders, one ring per agent in sorted id order, concentric from
+   * `radius × innerScale` outward by `spacing`. A set is only rebuilt when its agents, their
+   * executing flags or the radii differ from what is drawn, so state changes are cheap and
+   * untouched rings keep their objects. Runs after `rebuildAnchorIndex` and after node restyles.
+   */
+  function rebuildAgentRings(): void {
+    agentRingsDirty = false;
+    const keep = new Set<string>();
+    if (agentRingStyle.show) {
+      for (const [anchorId, spiderIds] of anchoredBy) {
+        const anchor = entries.get(anchorId);
+        if (!anchor?.mesh || anchor.node.layer !== "web") continue;
+        const existing = agentRingSets.get(anchorId);
+        const prior = existing?.entry === anchor ? existing : undefined;
+        let count = 0;
+        let same = prior !== undefined;
+        for (const id of spiderIds) {
+          const spider = entries.get(id);
+          if (!spider?.mesh || !(spider.node instanceof AgentNode)) continue;
+          if (same) {
+            const ring = prior?.rings[count];
+            same =
+              ring !== undefined &&
+              ring.agentId === id &&
+              ring.executing === (spider.node.state === "executing") &&
+              ring.radius === agentRingRadius(anchor, count);
+          }
+          count++;
+        }
+        if (count === 0) continue;
+        keep.add(anchorId);
+        if (same && prior?.rings.length === count) continue;
+        if (existing) disposeAgentRingSet(existing);
+        const set: AgentRingSet = { entry: anchor, rings: [] };
+        for (const id of spiderIds) {
+          const spider = entries.get(id);
+          if (!spider?.mesh || !(spider.node instanceof AgentNode)) continue;
+          const executing = spider.node.state === "executing";
+          const radius = agentRingRadius(anchor, set.rings.length);
+          const line = new Line2(agentRingGeometry, executing ? agentRingDashedMaterial : agentRingSolidMaterial);
+          line.frustumCulled = false;
+          line.renderOrder = AGENT_RING_RENDER_ORDER;
+          line.scale.setScalar(radius);
+          scene.add(line);
+          set.rings.push({ agentId: id, executing, radius, line });
+        }
+        agentRingSets.set(anchorId, set);
+      }
+    }
+    for (const [anchorId, set] of agentRingSets) {
+      if (keep.has(anchorId)) continue;
+      disposeAgentRingSet(set);
+      agentRingSets.delete(anchorId);
+    }
+  }
+
+  function agentRingRadius(anchor: NodeEntry, slot: number): number {
+    return anchor.visual.radius * agentRingStyle.innerScale + slot * agentRingStyle.spacing;
+  }
+
+  /** Style change: shared materials take the new width/colour; radii and `show` go through the reconcile. */
+  function restyleAgentRings(): void {
+    for (const material of [agentRingSolidMaterial, agentRingDashedMaterial]) {
+      material.linewidth = agentRingStyle.width;
+      material.color.copy(colorFor(agentRingStyle.color));
+    }
+    rebuildAgentRings();
+  }
+
+  /** Per frame: rings follow their node; executing rings spin about the ring normal, billboarded in 3D. */
+  function updateAgentRings(time: number): void {
+    const spin = ((time / 1000) * agentRingStyle.rotateDegPerSec * THREE.MathUtils.DEG2RAD) % (Math.PI * 2);
+    const billboard = mode === "3d-hub";
+    for (const set of agentRingSets.values()) {
+      const { sim, mesh } = set.entry;
+      const x = sim.x ?? 0;
+      const y = sim.y ?? 0;
+      const z = sim.z ?? 0;
+      const visible = mesh !== null && mesh.visible;
+      for (const ring of set.rings) {
+        const { line } = ring;
+        line.visible = visible;
+        if (!visible) continue;
+        line.position.set(x, y, z);
+        agentRingSpin.setFromAxisAngle(agentRingAxis, ring.executing ? spin : 0);
+        if (billboard) line.quaternion.copy(camera.quaternion).multiply(agentRingSpin);
+        else line.quaternion.copy(agentRingSpin);
+      }
+    }
   }
 
   /** Place each arrowhead on the segment, tip touching the target sphere. */
@@ -1277,6 +1576,8 @@ export function createGraphRenderer(
     } else if (recolor) {
       refreshLineColors();
     }
+    // Structural/drawable paths reconcile via `rebuildAnchorIndex`; a bare agent state change lands here.
+    if (agentRingsDirty) rebuildAgentRings();
   }
 
   // ---- picking -------------------------------------------------------------------------------
@@ -1329,7 +1630,8 @@ export function createGraphRenderer(
       refreshMaterial(current);
       refreshLabel(current);
     }
-    refreshLineColors();
+    // The selected node's connectors change width, hence batch: regroup rather than just recolour.
+    rebuildLineBuffers();
     emit({ type: "select", id });
   }
 
@@ -1505,6 +1807,7 @@ export function createGraphRenderer(
     }
     updateLinePositions();
     updateCones();
+    updateAgentRings(time);
     renderer.clear();
     renderer.render(hullScene, camera);
     renderer.render(scene, camera);
@@ -1529,6 +1832,8 @@ export function createGraphRenderer(
     setStyle(style: GraphStyle) {
       resolver = new StyleResolver(style);
       colorCache = new Map();
+      selectionStyle = resolver.selectionVisual();
+      agentRingStyle = resolver.agentRingVisual();
       const previousPadding = clusterStyle.padding;
       clusterStyle = resolver.clusterVisual();
       labelSettings = resolver.labels();
@@ -1536,7 +1841,6 @@ export function createGraphRenderer(
       labelStyle = { color: labelCss(), bakeFontSizePx: labelSettings.maxFontSizePx };
       let resimulate = previousPadding !== clusterStyle.padding;
       let drawablesChanged = false;
-      let batchesChanged = false;
       for (const entry of entries.values()) {
         const previousRadius = entry.visual.radius;
         const flipped = restyleNode(entry);
@@ -1547,19 +1851,17 @@ export function createGraphRenderer(
           drawablesChanged = true;
         }
       }
-      for (const entry of connectorEntries.values()) {
-        if (restyleConnector(entry)) batchesChanged = true;
-      }
+      for (const entry of connectorEntries.values()) restyleConnector(entry);
       if (resimulate) {
         syncSimulation();
         simulation.alpha(Math.max(simulation.alpha(), 0.3));
       } else if (drawablesChanged) {
         refreshDrawables();
-      } else if (batchesChanged) {
-        rebuildLineBuffers();
       } else {
-        refreshLineColors();
+        // Widths, dash flags and the selection width scale are all batch keys: regroup unconditionally.
+        rebuildLineBuffers();
       }
+      restyleAgentRings();
       for (const drawable of clusterDrawables.values()) restyleClusterDrawable(drawable);
       hullsDirty = true;
     },
@@ -1629,15 +1931,19 @@ export function createGraphRenderer(
       for (const entry of connectorEntries.values()) disposeConnectorEntry(entry);
       for (const drawable of clusterDrawables.values()) disposeClusterDrawable(drawable);
       clusterDrawables.clear();
+      for (const batch of lineBatches.values()) disposeLineBatch(batch);
+      lineBatches.clear();
+      lineBatchList = [];
+      for (const set of agentRingSets.values()) disposeAgentRingSet(set);
+      agentRingSets.clear();
       entries.clear();
       connectorEntries.clear();
       sphereGeometry.dispose();
       ringGeometry.dispose();
       coneGeometry.dispose();
-      solid.geometry.dispose();
-      dashed.geometry.dispose();
-      solidMaterial.dispose();
-      dashedMaterial.dispose();
+      agentRingGeometry.dispose();
+      agentRingSolidMaterial.dispose();
+      agentRingDashedMaterial.dispose();
       renderer.dispose();
       canvas.remove();
     },
