@@ -56,9 +56,10 @@ export interface LabelSettings {
 }
 
 /**
- * Agentic work as modifiers on a worktree: one ring per anchored agent (dashed + rotating while it
- * executes), one radial spoke per subagent on that ring with a small ring tip (dashed + rotating
- * while it runs).
+ * Agentic work as modifiers on a worktree: one ring per anchored root agent (dashed + rotating
+ * while it executes), one radial spoke per subagent or child agent on that ring — two parallel
+ * dashed lanes (counter-marching while it runs) ending in a ring tip (dashed + rotating while it
+ * runs).
  */
 export interface AgentRingVisual {
   show: boolean;
@@ -67,10 +68,14 @@ export interface AgentRingVisual {
   innerScale: number;
   spacing: number;
   rotateDegPerSec: number;
-  /** Spoke length as a multiple of the anchor's radius. */
+  /** Spoke length (ring edge to tip centre) as a multiple of the anchor's radius. */
   spokeScale: number;
   /** Tip ring radius as a multiple of the anchor's radius. */
   spokeTipScale: number;
+  /** Half-separation of a spoke's two lanes from its centre line, world units. */
+  spokeLaneGap: number;
+  /** On-screen inner ring radius (px) below which rings go solid and still and spokes hide; ±10 % hysteresis. */
+  lodRadiusPx: number;
   /** 0..1 mix of `color` toward foreground for a running subagent's tip. */
   spokeLighten: number;
 }

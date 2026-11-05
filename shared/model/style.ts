@@ -109,9 +109,10 @@ export const GraphStyle = z.object({
     })
     .optional(),
   /**
-   * Agentic work drawn as modifiers on a worktree: one ring per agent anchored to it (concentric
-   * when several; dashed and rotating while the agent executes) and one radial spoke per subagent
-   * on that agent's ring, ending in a small ring tip (dashed and rotating while the subagent runs).
+   * Agentic work drawn as modifiers on a worktree: one ring per root agent anchored to it
+   * (concentric when several; dashed and rotating while the agent executes) and one radial spoke
+   * per subagent or child agent on that agent's ring — two parallel dashed lanes, counter-marching
+   * while it runs — ending in a ring tip (dashed and rotating while it runs).
    */
   agentRings: z
     .object({
@@ -125,10 +126,14 @@ export const GraphStyle = z.object({
       spacing: z.number().positive().optional(),
       /** Degrees per second for active (dashed) rings and tips. */
       rotateDegPerSec: z.number().optional(),
-      /** Spoke length as a multiple of the node radius. */
+      /** Spoke length (ring edge to tip centre) as a multiple of the node radius. */
       spokeScale: z.number().positive().optional(),
       /** Spoke tip ring radius as a multiple of the node radius. */
       spokeTipScale: z.number().positive().optional(),
+      /** Half-separation of a spoke's two lanes from its centre line, world units. */
+      spokeLaneGap: z.number().positive().optional(),
+      /** On-screen inner ring radius in px below which rings draw solid and still and spokes are hidden (±10 % hysteresis). */
+      lodRadiusPx: z.number().positive().optional(),
       /** 0..1 mix of the ring colour toward `foreground` for a running subagent's tip. */
       spokeLighten: z.number().min(0).max(1).optional(),
     })
@@ -146,8 +151,10 @@ export const DEFAULT_STYLE: GraphStyle = {
     innerScale: 1.35,
     spacing: 0.3,
     rotateDegPerSec: 45,
-    spokeScale: 0.7,
-    spokeTipScale: 0.16,
+    spokeScale: 1.1,
+    spokeTipScale: 0.45,
+    spokeLaneGap: 0.12,
+    lodRadiusPx: 28,
     spokeLighten: 0.35,
   },
   nodes: {
@@ -308,8 +315,10 @@ export class StyleResolver {
       innerScale: r.innerScale ?? 1.35,
       spacing: r.spacing ?? 0.3,
       rotateDegPerSec: r.rotateDegPerSec ?? 45,
-      spokeScale: r.spokeScale ?? 0.7,
-      spokeTipScale: r.spokeTipScale ?? 0.16,
+      spokeScale: r.spokeScale ?? 1.1,
+      spokeTipScale: r.spokeTipScale ?? 0.45,
+      spokeLaneGap: r.spokeLaneGap ?? 0.12,
+      lodRadiusPx: r.lodRadiusPx ?? 28,
       spokeLighten: r.spokeLighten ?? 0.35,
     };
   }

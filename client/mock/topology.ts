@@ -108,7 +108,12 @@ function worktree(
   return id;
 }
 
-function agent(worktreeId: string, index: number, label: string, state: AgentState): string {
+/**
+ * Agent on `worktreeId`; `parentId` (an agent node id on the same worktree) makes it a child
+ * context — `parentAgentId` carries the parent's paseo agent id, as the builder reads it from the
+ * `paseo.parent-agent-id` label — which the renderer draws as a spoke on the parent's ring.
+ */
+function agent(worktreeId: string, index: number, label: string, state: AgentState, parentId?: string): string {
   const path = `${worktreeId.slice("wt:".length)}/${index}`;
   const id = node({
     id: `agent:${path}`,
@@ -119,6 +124,7 @@ function agent(worktreeId: string, index: number, label: string, state: AgentSta
     agentId: path,
     provider: "omp",
     state,
+    parentAgentId: parentId?.slice("agent:".length),
   });
   link("contains", worktreeId, id);
   return id;
@@ -181,8 +187,9 @@ function build(): void {
   mergesInto(grReviewRig, grIntegration, "included");
   mergesInto(grMaterials, grIntegration, "stale");
 
+  // Root agent with a child agent (spoke) and subagents: one ring.
   const grRig1 = agent(grReviewRig, 1, "review rig builder", "executing");
-  const grRig2 = agent(grReviewRig, 2, "rig QA", "thinking");
+  const grRig2 = agent(grReviewRig, 2, "rig QA", "thinking", grRig1);
   const grRigScout = subagent(grRig1, 1, "scout: USD schema", "completed");
   subagent(grRig1, 2, "camera presets", "running");
   subagent(grRig1, 3, "lighting pass", "running");
@@ -199,6 +206,7 @@ function build(): void {
   branch(grid, "main", { worktreeId: gridMain, isDefault: true });
   branch(grid, "feature/scene-graph-cache", { worktreeId: gridCache, base: { name: "main", via: "inferred", commitsAhead: 3 } });
   agent(gridMain, 1, "release notes", "idle");
+  // Two independent root agents on one checkout: two concentric rings.
   const gridCache1 = agent(gridCache, 1, "cache implementer", "executing");
   agent(gridCache, 2, "bench runner", "error");
   subagent(gridCache1, 1, "profile hot paths", "running");
@@ -219,7 +227,7 @@ function build(): void {
   branch(leyline, "feature/force-layout", { worktreeId: leylineLayout, base: { name: "main", via: "config", commitsAhead: 9 } });
   agent(leylineMain, 1, "docs keeper", "idle");
   const leyline1 = agent(leylineLayout, 1, "renderer", "executing");
-  const leyline2 = agent(leylineLayout, 2, "fixtures & panel", "attention");
+  const leyline2 = agent(leylineLayout, 2, "fixtures & panel", "attention", leyline1);
   subagent(leyline1, 1, "d3-force-3d typings", "running");
   subagent(leyline1, 2, "orbit controls", "completed");
   touches(leyline1, leylineLayout, ["client/renderer/layout.ts", "client/web.ts", "shared/graph.ts"]);
