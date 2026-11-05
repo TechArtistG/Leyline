@@ -37,8 +37,8 @@ export function createCluster<N extends ClusterNode>(id: string): Cluster<N> {
   return { id, members: [], extent: [], x: 0, y: 0, z: 0, r: 0, bandY: 0 };
 }
 
-/** Recompute centroid and padded bounding radius. A cluster without placed members gets `r = 0` and is ignored by the forces. */
-export function measureCluster<N extends ClusterNode>(c: Cluster<N>, padding: number, axes: ClusterAxes): void {
+/** Recompute the centroid of `members`; false (and `r = 0`) when none is placed yet. */
+export function centerCluster<N extends ClusterNode>(c: Cluster<N>): boolean {
   let sx = 0;
   let sy = 0;
   let sz = 0;
@@ -52,11 +52,17 @@ export function measureCluster<N extends ClusterNode>(c: Cluster<N>, padding: nu
   }
   if (count === 0) {
     c.r = 0;
-    return;
+    return false;
   }
   c.x = sx / count;
   c.y = sy / count;
   c.z = sz / count;
+  return true;
+}
+
+/** Recompute centroid and padded bounding radius. A cluster without placed members gets `r = 0` and is ignored by the forces. */
+export function measureCluster<N extends ClusterNode>(c: Cluster<N>, padding: number, axes: ClusterAxes): void {
+  if (!centerCluster(c)) return;
   let r = 0;
   for (const n of c.extent) {
     if (n.x === undefined) continue;

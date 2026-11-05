@@ -14,6 +14,7 @@ import {
   type ClusterAxes,
   HULL_SAMPLES,
   ROOT_CLUSTER,
+  centerCluster,
   clusterHull2d,
   countClusterOverlaps,
   createCluster,
@@ -71,6 +72,8 @@ interface SimNode extends D3.SimulationNode {
   radius: number;
   /** Repo id this node is contained in (spiders: their anchor's), or `ROOT_CLUSTER` above the repos. */
   clusterId: string;
+  /** Label metric/LOD of that cluster; the frame loop reads it per node without a lookup. */
+  lod: ClusterLod;
 }
 interface SimLink extends D3.SimulationLink<SimNode> {
   id: string;
@@ -106,6 +109,19 @@ interface ConnectorEntry {
   revision: number;
   /** Arrowhead at the target when `visual.directed` and drawn. */
   cone: Three.Mesh<Three.ConeGeometry, Three.MeshBasicMaterial> | null;
+}
+/**
+ * Label metric and zoom LOD of one cluster. Nodes point at their cluster's record, so labels inside
+ * one project scale and tier-switch on that project's own screen size. Records are keyed by cluster
+ * id and survive cluster rebuilds, which keeps the hysteresis state across model changes.
+ */
+interface ClusterLod {
+  /** Font size for this cluster's labels this frame, CSS px, from px per world unit at the cluster centre (root: at the orbit target). */
+  fontPx: number;
+  /** True while `all`-tier labels show; flips with hysteresis in the frame loop. */
+  lodAll: boolean;
+  /** `lodAll` changed this frame: the node loop refreshes label visibility for members. */
+  flipped: boolean;
 }
 /** Hull drawn around one non-root cluster: a flat outline + fill in 2D modes, a translucent sphere in 3D. */
 interface ClusterDrawable {
@@ -154,8 +170,8 @@ const LR_CHARGE_STRENGTH = -10;
 const LR_BAND_STRENGTH = 0.3;
 /** Band height = (tallest column in the cluster + this) × row spacing. */
 const LR_BAND_SLACK_ROWS = 1;
-/** 2D hulls sit this far behind the z = 0 node plane (fill), with the outline halfway up. */
-const HULL_Z = -1;
+/** Within the hull pass (no depth test) the outline/wireframe draws after the fill it borders. */
+const HULL_EDGE_RENDER_ORDER = 1;
 /** Outline opacity relative to the fill opacity (2D), and wireframe opacity relative to the sphere (3D). */
 const HULL_OUTLINE_OPACITY = 2.5;
 const HULL_WIRE_OPACITY = 0.35;
@@ -248,9 +264,21 @@ export function createGraphRenderer(
   let labelSettings: LabelSettings = resolver.labels();
   /** Baked once per label at the largest size it can show; the sprite scales it down per frame. */
   let labelStyle: LabelStyle = { color: labelCss(), bakeFontSizePx: labelSettings.maxFontSizePx };
-  /** Zoom LOD state: true while `all`-tier labels show. Flips with hysteresis in the frame loop. */
-  let labelLodAll = true;
-  /** Reused per frame; `anchor` and `clearancePx` are per node, the rest per frame. */
+  /**
+   * Cluster id → label metric/LOD record. Rebuilt with the clusters, carrying over each id's
+   * record so the hysteresis state (`lodAll`) survives model changes. Ids that only hidden nodes
+   * still point at keep a record too, so every `SimNode.lod` stays valid.
+   */
+  let clusterLodById = new Map<string, ClusterLod>();
+  /** `clusterLodById` records aligned with `clusters`, so the frame loop walks both by index. */
+  const clusterLods: ClusterLod[] = [];
+
+  function clusterLodFor(id: string): ClusterLod {
+    let lod = clusterLodById.get(id);
+    if (!lod) clusterLodById.set(id, (lod = { fontPx: labelSettings.fontSizePx, lodAll: true, flipped: false }));
+    return lod;
+  }
+  /** Reused per frame; `fontPx` is per cluster, `anchor` and `clearancePx` per node, `scalePerPx` per frame. */
   const labelLayout: LabelLayout = { fontPx: labelSettings.fontSizePx, scalePerPx: 1, anchor: "above", clearancePx: 0 };
   const labelTmp = new THREE.Vector3();
 
@@ -261,6 +289,8 @@ export function createGraphRenderer(
   const canvas = renderer.domElement as unknown as CanvasElement;
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(width, height);
+  // Two passes per frame (hulls, then the graph): cleared once by hand in the frame loop.
+  renderer.autoClear = false;
   canvas.style.display = "block";
   host.appendChild(renderer.domElement);
 
@@ -269,6 +299,11 @@ export function createGraphRenderer(
   const key = new THREE.DirectionalLight(0xffffff, 1.2);
   key.position.set(5, 10, 7);
   scene.add(key);
+  /**
+   * Cluster hulls live in their own scene, rendered before `scene` without depth: they are a
+   * backdrop and never occlude a node, connector or label, whatever the depths involved.
+   */
+  const hullScene = new THREE.Scene();
 
   const sphereGeometry = new THREE.SphereGeometry(1, 24, 16);
   const ringGeometry = new THREE.TorusGeometry(1, RING_TUBE, 8, 48);
@@ -422,9 +457,17 @@ export function createGraphRenderer(
       if (!c) clusterById.set(id, (c = createCluster<SimNode>(id)));
       return c;
     };
+    const previousLods = clusterLodById;
+    clusterLodById = new Map();
+    const lodFor = (id: string): ClusterLod => {
+      const kept = previousLods.get(id);
+      if (kept && !clusterLodById.has(id)) clusterLodById.set(id, kept);
+      return clusterLodFor(id);
+    };
     for (const e of entries.values()) {
       if (e.node.layer !== "web") continue;
       e.sim.clusterId = repoAncestor(e.node.id, memo, new Set());
+      e.sim.lod = lodFor(e.sim.clusterId);
       if (!e.mesh) continue;
       const c = clusterFor(e.sim.clusterId);
       c.members.push(e.sim);
@@ -440,9 +483,12 @@ export function createGraphRenderer(
       }
       const web = anchor?.node.layer === "web" && anchor.mesh ? anchor : undefined;
       e.sim.clusterId = web ? web.sim.clusterId : ROOT_CLUSTER;
+      e.sim.lod = lodFor(e.sim.clusterId);
       if (web && e.mesh) clusterFor(e.sim.clusterId).extent.push(e.sim);
     }
     clusters = [...clusterById.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    clusterLods.length = 0;
+    for (const c of clusters) clusterLods.push(lodFor(c.id));
     rebuildClusterDrawables();
   }
 
@@ -696,11 +742,11 @@ export function createGraphRenderer(
   let selectedId: string | null = null;
   let hoveredId: string | null = null;
 
-  /** Hover/select always show; otherwise `labelAlways`, gated by the zoom LOD for `all`-tier labels. */
+  /** Hover/select always show; otherwise `labelAlways`, gated by the node's cluster zoom LOD for `all`-tier labels. */
   function labelVisible(entry: NodeEntry): boolean {
     const id = entry.node.id;
     if (id === selectedId || id === hoveredId) return true;
-    return entry.visual.labelAlways && (labelLodAll || entry.visual.labelTier === "project");
+    return entry.visual.labelAlways && (entry.sim.lod.lodAll || entry.visual.labelTier === "project");
   }
 
   function refreshLabel(entry: NodeEntry): void {
@@ -834,7 +880,7 @@ export function createGraphRenderer(
     const visual = resolver.nodeVisual(node);
     const entry: NodeEntry = {
       node,
-      sim: { id: node.id, radius: visual.radius, clusterId: ROOT_CLUSTER },
+      sim: { id: node.id, radius: visual.radius, clusterId: ROOT_CLUSTER, lod: clusterLodFor(ROOT_CLUSTER) },
       visual,
       revision: node.revision,
       anchorId: node.anchorId,
@@ -1012,8 +1058,10 @@ export function createGraphRenderer(
     const flat = mode !== "3d-hub";
     const fillMaterial = new THREE.MeshBasicMaterial({
       transparent: true,
+      depthTest: false,
       depthWrite: false,
       toneMapped: false,
+      // 3D: back faces only, so the far half tints the cluster interior and the near half never covers it.
       side: flat ? THREE.DoubleSide : THREE.BackSide,
     });
     let drawable: ClusterDrawable;
@@ -1035,12 +1083,11 @@ export function createGraphRenderer(
       outlineGeometry.setAttribute("position", positionAttribute);
       const outline = new THREE.LineLoop(
         outlineGeometry,
-        new THREE.LineBasicMaterial({ transparent: true, depthWrite: false, toneMapped: false }),
+        new THREE.LineBasicMaterial({ transparent: true, depthTest: false, depthWrite: false, toneMapped: false }),
       );
-      outline.position.z = -HULL_Z / 2;
       outline.frustumCulled = false;
-      outline.renderOrder = -1;
-      scene.add(outline);
+      outline.renderOrder = HULL_EDGE_RENDER_ORDER;
+      hullScene.add(outline);
       drawable = {
         cluster,
         fill: new THREE.Mesh(fillGeometry, fillMaterial),
@@ -1052,11 +1099,11 @@ export function createGraphRenderer(
     } else {
       const wire = new THREE.Mesh(
         sphereGeometry,
-        new THREE.MeshBasicMaterial({ wireframe: true, transparent: true, depthWrite: false, toneMapped: false }),
+        new THREE.MeshBasicMaterial({ wireframe: true, transparent: true, depthTest: false, depthWrite: false, toneMapped: false }),
       );
       wire.frustumCulled = false;
-      wire.renderOrder = -1;
-      scene.add(wire);
+      wire.renderOrder = HULL_EDGE_RENDER_ORDER;
+      hullScene.add(wire);
       drawable = {
         cluster,
         fill: new THREE.Mesh(sphereGeometry, fillMaterial),
@@ -1067,24 +1114,23 @@ export function createGraphRenderer(
       };
     }
     drawable.fill.frustumCulled = false;
-    drawable.fill.renderOrder = -1;
-    scene.add(drawable.fill);
+    hullScene.add(drawable.fill);
     restyleClusterDrawable(drawable);
     return drawable;
   }
 
   function disposeClusterDrawable(drawable: ClusterDrawable): void {
-    scene.remove(drawable.fill);
+    hullScene.remove(drawable.fill);
     drawable.fill.material.dispose();
     if (drawable.outline) {
       // Flat hulls own their geometry; 3D hulls share `sphereGeometry` with the nodes.
       drawable.fill.geometry.dispose();
-      scene.remove(drawable.outline);
+      hullScene.remove(drawable.outline);
       drawable.outline.geometry.dispose();
       drawable.outline.material.dispose();
     }
     if (drawable.wire) {
-      scene.remove(drawable.wire);
+      hullScene.remove(drawable.wire);
       drawable.wire.material.dispose();
     }
   }
@@ -1128,7 +1174,7 @@ export function createGraphRenderer(
         for (let i = 0; i < count; i++) {
           positions[i * 3] = hull[i * 2];
           positions[i * 3 + 1] = hull[i * 2 + 1];
-          positions[i * 3 + 2] = HULL_Z;
+          positions[i * 3 + 2] = 0;
         }
         const attribute = fill.geometry.getAttribute("position");
         if (attribute) attribute.needsUpdate = true;
@@ -1399,21 +1445,34 @@ export function createGraphRenderer(
     // view-space length ℓ covers ℓ·m11·height/2 px — divided by view depth under perspective.
     const perspective = camera instanceof THREE.PerspectiveCamera;
     const unitPx = (camera.projectionMatrix.elements[5] * height) / 2;
-    const pxPerUnit = perspective ? unitPx / Math.max(camera.position.distanceTo(controls.target), 1e-3) : unitPx;
+    // Orbit-target metric: the root cluster, and every cluster under an orthographic camera, where
+    // `zoom` makes px per unit depth-independent and the LOD is therefore global by nature.
+    const targetPxPerUnit = perspective ? unitPx / Math.max(camera.position.distanceTo(controls.target), 1e-3) : unitPx;
     const lodThreshold = labelSettings.allAbovePxPerUnit;
-    const wasLodAll = labelLodAll;
-    if (labelLodAll && pxPerUnit < lodThreshold * (1 - LABEL_LOD_HYSTERESIS)) labelLodAll = false;
-    else if (!labelLodAll && pxPerUnit > lodThreshold * (1 + LABEL_LOD_HYSTERESIS)) labelLodAll = true;
-    if (labelLodAll !== wasLodAll) for (const entry of entries.values()) refreshLabel(entry);
-    labelLayout.fontPx = Math.min(
-      labelSettings.maxFontSizePx,
-      Math.max(labelSettings.fontSizePx, (labelSettings.fontSizePx * pxPerUnit) / labelSettings.referencePxPerUnit),
-    );
+    for (let i = 0; i < clusters.length; i++) {
+      const cluster = clusters[i];
+      const lod = clusterLods[i];
+      // Per-project metric under perspective: px per unit at the view depth of the cluster centroid,
+      // so the project the camera closes in on grows its labels and switches tier before the others.
+      const pxPerUnit =
+        perspective && cluster.id !== ROOT_CLUSTER && centerCluster(cluster)
+          ? unitPx / Math.max(-labelTmp.set(cluster.x, cluster.y, cluster.z).applyMatrix4(camera.matrixWorldInverse).z, 1e-3)
+          : targetPxPerUnit;
+      lod.fontPx = Math.min(
+        labelSettings.maxFontSizePx,
+        Math.max(labelSettings.fontSizePx, (labelSettings.fontSizePx * pxPerUnit) / labelSettings.referencePxPerUnit),
+      );
+      const wasAll = lod.lodAll;
+      if (lod.lodAll && pxPerUnit < lodThreshold * (1 - LABEL_LOD_HYSTERESIS)) lod.lodAll = false;
+      else if (!lod.lodAll && pxPerUnit > lodThreshold * (1 + LABEL_LOD_HYSTERESIS)) lod.lodAll = true;
+      lod.flipped = lod.lodAll !== wasAll;
+    }
     // Non-attenuated sprite scale is in view-space units at depth 1 (perspective) or world units (ortho): px / unitPx.
     labelLayout.scalePerPx = 1 / unitPx;
     const pulse = 1.06 + 0.06 * Math.sin((time / PULSE_PERIOD_MS) * Math.PI * 2);
     for (const entry of entries.values()) {
       const { sim, mesh, visual } = entry;
+      if (sim.lod.flipped) refreshLabel(entry);
       if (!mesh?.visible) continue;
       const x = sim.x ?? 0;
       const y = sim.y ?? 0;
@@ -1435,6 +1494,7 @@ export function createGraphRenderer(
         const nodePxPerUnit = perspective
           ? unitPx / Math.max(-labelTmp.set(x, y, z).applyMatrix4(camera.matrixWorldInverse).z, 1e-3)
           : unitPx;
+        labelLayout.fontPx = sim.lod.fontPx;
         labelLayout.anchor = visual.labelAnchor;
         labelLayout.clearancePx = visual.radius * nodePxPerUnit + labelSettings.offsetPx;
         label.layout(labelLayout);
@@ -1442,6 +1502,8 @@ export function createGraphRenderer(
     }
     updateLinePositions();
     updateCones();
+    renderer.clear();
+    renderer.render(hullScene, camera);
     renderer.render(scene, camera);
   });
 

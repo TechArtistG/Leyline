@@ -70,6 +70,7 @@ export const GraphStyle = z.object({
       anchor: z.enum(LABEL_ANCHORS).optional(),
       /** Screen-space gap between the node's silhouette and the label. */
       offsetPx: z.number().min(0).optional(),
+      /** Both thresholds are measured per project: at the repo cluster's centre in `3d-hub`, uniformly in 2D modes. */
       lod: z
         .object({
           /** Pixels one world unit occupies on screen; below this only `project`-tier labels show. */
