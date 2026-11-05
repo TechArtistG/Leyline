@@ -6,6 +6,7 @@ import type {
 } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { GraphView } from "./client/graph-view";
+import { LEYLINE_ICON } from "./client/logo";
 
 const HUB = "hub";
 const PANEL = "graph";
@@ -21,7 +22,7 @@ function WorkspacePanel({ theme, workspaceId }: PluginWorkspacePanelProps) {
 function HubItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
   return (
     <SidebarRow
-      icon="Waypoints"
+      icon={LEYLINE_ICON}
       active={currentScreen?.screenId === HUB}
       onPress={() => openScreen({ screenId: HUB })}
     />
@@ -35,7 +36,7 @@ export default function contribute(client: PluginClientContext) {
     client.addWorkspacePanel({
       id: PANEL,
       title: "Leyline",
-      icon: "Waypoints",
+      icon: LEYLINE_ICON,
       locations: ["workspace", "explorer"],
       Component: WorkspacePanel,
     }),

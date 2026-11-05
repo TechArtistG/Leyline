@@ -191,7 +191,7 @@ interface GraphRenderer {
 - [x] **Bundling spike**: three.js scene mounted in a Paseo workspace panel; WebGL 2.0, resize, `three/addons` subpath export verified. `require("three")` fails (`process.emitWarning`), dynamic `import()` works
 - [x] Decide renderer: three.js DIY — [ADR-001](docs/ADR-001-renderer.md)
 - [ ] Mock topology fixtures (hosts, repos, worktrees, agents, subagents) rendered in 2D and 3D
-- [ ] Leyline logo (directed "L") as the sidebar item and panel icon
+- [x] Leyline logo (directed "L"): `assets/icon.png` in the manifest, monochrome SVG (`client/logo.ts`) as the sidebar item and panel icon
 
 ### Phase 2: Live topology
 - [ ] `server/topology`: `workspaces.list` / `agents.list` subscriptions + `provider_subagents` events → `GraphPatch` stream over a plugin subscription

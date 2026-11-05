@@ -1,6 +1,7 @@
 {
   "id": "leyline",
   "name": "Leyline",
+  "icon": "assets/icon.png",
   "description": "Visual hub for multi-repo, multi-agent development: repos, worktrees, agents and their connections as a live 2D/3D graph.",
   "media": [],
   "requirements": {
