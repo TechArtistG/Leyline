@@ -1,39 +1,56 @@
 import type { PluginTheme } from "@getpaseo/plugin";
-import { useRpc } from "@getpaseo/plugin/client";
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { usePaseo, useRpc } from "@getpaseo/plugin/client";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
-import { loadStyleRpc, rendererReportRpc } from "../shared/contracts";
+import { listBranchesRpc, loadStyleRpc, rendererReportRpc } from "../shared/contracts";
 import { GRAPH_MODES, GRAPH_MODE_LABELS, type GraphHandle, type GraphMode } from "../shared/graph";
 import { Graph } from "../shared/model/graph";
 import { type GraphStyle, parseGraphStyle } from "../shared/model/style";
 import { mockTopology } from "./mock/topology";
+import { startTopology } from "./topology/builder";
 import { mountGraph } from "./web";
 
 interface GraphViewProps {
   theme: PluginTheme;
   surface: "hub" | "workspace";
   caption: string;
-  /** Workspace whose `.leyline/style.json` to load; omitted on the hub. */
+  /** Paseo host this surface is rendered for; becomes the `host:<id>` node. */
+  hostId: string;
+  hostLabel: string;
+  /** Workspace whose `.leyline/style.json` to load and whose project scopes the graph; omitted on the hub. */
   workspaceId?: string;
 }
+
+type Source = "live" | "mock";
 
 const MODES: ReadonlyArray<{ mode: GraphMode; label: string }> = GRAPH_MODES.map((mode) => ({
   mode,
   label: GRAPH_MODE_LABELS[mode],
 }));
 
+const SOURCES: ReadonlyArray<{ source: Source; label: string }> = [
+  { source: "live", label: "Live" },
+  { source: "mock", label: "Mock" },
+];
+
 /** Hosts the WebGL graph. On native there is no renderer, so it shows a notice instead. */
-export function GraphView({ theme, surface, caption, workspaceId }: GraphViewProps) {
+export function GraphView({ theme, surface, caption, hostId, hostLabel, workspaceId }: GraphViewProps) {
   const parent = useRef<View>(null);
   const graph = useRef<GraphHandle | null>(null);
+  // One model per component; the renderer remounts on theme change and re-reads it, the topology does not restart.
+  const [model] = useState(() => new Graph());
+  const paseo = usePaseo();
   const report = useRpc(rendererReportRpc);
   const loadStyle = useRpc(loadStyleRpc);
+  const listBranches = useRpc(listBranchesRpc);
   const [mode, setModeState] = useState<GraphMode>("3d-hub");
+  const [source, setSource] = useState<Source>("live");
   // The renderer mounts once per theme/surface; mode changes go through `setMode` without a remount,
   // so the mount effect reads the current mode from a ref rather than depending on it.
   const modeRef = useRef<GraphMode>(mode);
   const [info, setInfo] = useState<string>(Platform.OS === "web" ? "mounting…" : "WebGL renderer is web-only");
   const [styleError, setStyleError] = useState<string | null>(null);
+  const [topologyError, setTopologyError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
 
   const styles = useMemo(
@@ -79,9 +96,6 @@ export function GraphView({ theme, surface, caption, workspaceId }: GraphViewPro
     if (Platform.OS !== "web") return;
     let cancelled = false;
     let unsubscribe: (() => void) | undefined;
-    // One model per mount; the renderer subscribes to it and also reads whatever is in it at mount.
-    const model = new Graph();
-    model.applyPatch(mockTopology());
     // Mount and style load run concurrently; whichever finishes second applies the style.
     let loadedStyle: GraphStyle | undefined;
     void (async () => {
@@ -132,7 +146,30 @@ export function GraphView({ theme, surface, caption, workspaceId }: GraphViewPro
       setSelected(null);
       setStyleError(null);
     };
-  }, [loadStyle, report, surface, theme, workspaceId]);
+  }, [loadStyle, model, report, surface, theme, workspaceId]);
+
+  // Data source: the live Paseo topology or the fixture. Switching empties the model first so the
+  // renderer never shows a blend; the live builder is stopped (every subscription released) on cleanup.
+  useEffect(() => {
+    if (Platform.OS !== "web") return;
+    model.applyPatch({ removeNodes: [...model.nodes.keys()] });
+    setSelected(null);
+    setTopologyError(null);
+    if (source === "mock") {
+      model.applyPatch(mockTopology());
+      return;
+    }
+    const topology = startTopology({
+      paseo,
+      hostId,
+      hostLabel,
+      graph: model,
+      listBranches,
+      scope: workspaceId ? { workspaceId } : undefined,
+      onError: setTopologyError,
+    });
+    return () => topology.stop();
+  }, [hostId, hostLabel, listBranches, model, paseo, source, workspaceId]);
 
   const setMode = useCallback((next: GraphMode) => {
     modeRef.current = next;
@@ -142,7 +179,9 @@ export function GraphView({ theme, surface, caption, workspaceId }: GraphViewPro
   const relayout = useCallback(() => graph.current?.relayout(), []);
   const fit = useCallback(() => graph.current?.fit(), []);
 
-  const status = [selected, styleError, info].filter((part): part is string => part !== null).join(" · ");
+  const status = [selected, topologyError, styleError, info]
+    .filter((part): part is string => part !== null)
+    .join(" · ");
 
   return (
     <View style={styles.root}>
@@ -159,6 +198,23 @@ export function GraphView({ theme, surface, caption, workspaceId }: GraphViewPro
                 accessibilityLabel={`${label} layout`}
                 accessibilityState={{ selected: active }}
                 onPress={() => setMode(m)}
+                style={active ? [styles.button, styles.buttonActive] : styles.button}
+              >
+                <Text style={active ? styles.buttonTextActive : styles.buttonText}>{label}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+        <View style={styles.segment} accessibilityRole="radiogroup" accessibilityLabel="Data source">
+          {SOURCES.map(({ source: s, label }) => {
+            const active = s === source;
+            return (
+              <Pressable
+                key={s}
+                accessibilityRole="button"
+                accessibilityLabel={`${label} data`}
+                accessibilityState={{ selected: active }}
+                onPress={() => setSource(s)}
                 style={active ? [styles.button, styles.buttonActive] : styles.button}
               >
                 <Text style={active ? styles.buttonTextActive : styles.buttonText}>{label}</Text>

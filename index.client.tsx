@@ -12,12 +12,27 @@ const HUB = "hub";
 const PANEL = "graph";
 
 function HubScreen({ theme, host }: PluginScreenProps) {
-  return <GraphView theme={theme} surface="hub" caption={`Leyline hub · host ${host.label}`} />;
+  return (
+    <GraphView
+      theme={theme}
+      surface="hub"
+      hostId={host.id}
+      hostLabel={host.label}
+      caption={`Leyline hub · host ${host.label}`}
+    />
+  );
 }
 
-function WorkspacePanel({ theme, workspaceId }: PluginWorkspacePanelProps) {
+function WorkspacePanel({ theme, host, workspaceId }: PluginWorkspacePanelProps) {
   return (
-    <GraphView theme={theme} surface="workspace" workspaceId={workspaceId} caption={`Leyline · workspace ${workspaceId}`} />
+    <GraphView
+      theme={theme}
+      surface="workspace"
+      hostId={host.id}
+      hostLabel={host.label}
+      workspaceId={workspaceId}
+      caption={`Leyline · workspace ${workspaceId}`}
+    />
   );
 }
 

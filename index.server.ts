@@ -1,5 +1,6 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { loadStyleRpc, rendererReportRpc } from "./shared/contracts";
+import { listBranchesRpc, loadStyleRpc, rendererReportRpc } from "./shared/contracts";
+import { listBranches } from "./server/git";
 import { loadStyle } from "./server/style";
 
 export default function contribute(server: PluginServerContext) {
@@ -8,5 +9,6 @@ export default function contribute(server: PluginServerContext) {
     return { received: true as const };
   });
   server.handle(loadStyleRpc, (input, { paseo }) => loadStyle(input, paseo));
+  server.handle(listBranchesRpc, (input) => listBranches(input));
   return () => {};
 }

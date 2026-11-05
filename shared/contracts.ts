@@ -22,3 +22,28 @@ export const loadStyleRpc = defineRpc({
     error: z.string().nullable(),
   }),
 });
+
+/**
+ * Daemon runs `git` in a repo root to list local branches and which worktree (if any) has each checked out.
+ * Paseo only reports the current branch per workspace; everything else about local refs comes from here.
+ */
+export const listBranchesRpc = defineRpc({
+  name: "leyline.git.branches",
+  input: z.object({ repoRoot: z.string() }),
+  output: z.object({
+    /** Null when `repoRoot` is not a git repository or git failed; `error` explains. */
+    branches: z
+      .array(
+        z.object({
+          name: z.string(),
+          headSha: z.string(),
+          /** Absolute path of the worktree that has this branch checked out, if any. */
+          worktreePath: z.string().nullable(),
+        }),
+      )
+      .nullable(),
+    /** Worktrees known to git (`git worktree list`), including the main checkout. */
+    worktrees: z.array(z.object({ path: z.string(), branch: z.string().nullable(), headSha: z.string() })),
+    error: z.string().nullable(),
+  }),
+});

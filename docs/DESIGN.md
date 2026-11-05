@@ -13,7 +13,21 @@ Two layers, declared per node kind (`KIND_LAYER` in `shared/model/node.ts`):
 | `web` | `universe`, `host`, `repo`, `branch`, `worktree`, `file`, `pr` | The force simulation. Stable; agents never perturb it. |
 | `spider` | `agent`, `subagent` | Their `anchorId` (agent → worktree, subagent → parent agent): placed on a ring around the anchor, tweened along the web when the anchor changes. |
 
-Roots: `universe` is the abstract root everything hangs off; each Paseo daemon is a `host` beneath it. The topology builder will offer `roots: "hosts"` (universe → host → repo) or `roots: "universe"` (hosts collapsed) as a view setting.
+Roots: `universe` is the abstract root everything hangs off; each Paseo daemon is a `host` beneath it. A later view setting will offer `roots: "hosts"` (universe → host → repo) or `roots: "universe"` (hosts collapsed).
+
+### Topology builder
+
+`client/topology/builder.ts` (`startTopology`) runs where `usePaseo()` lives, so no daemon stream is needed. It mirrors four Paseo sources into plain maps — `workspaces.list({ subscribe })`, `agents.list({ subscribe })`, `projects.list()` + `projects.subscribe`, and `observeEvents(["agent.provider_subagents.update", "project.update"])` — plus per-repo git data from `listBranchesRpc` (fetched on first sight of a repo, every 15 s, and immediately when a workspace's `currentBranch` changes or a workspace appears). Any change schedules one coalesced `recompute()` that derives the whole desired node/connector set in O(n) and applies `{ upsert all, remove previously-emitted − desired }` through `Graph.applyPatch`, which drops no-op updates.
+
+Ids: `universe`, `host:<hostId>`, `repo:<projectId>`, `wt:<workspaceId>`, `wt:git:<projectId>/<basename>` (git worktree Paseo does not manage; `#<index>` appended on basename collisions), `branch:<projectId>/<name>`, `agent:<agentId>`, `sub:<subagentId>`; connectors `<kind>:<source>-><target>`, always parent → child.
+
+- **Repos**: every project in `projects.list()` or owning a visible (non-archived, non-internal) workspace.
+- **Worktrees**: the union of Paseo workspaces and `git worktree list`, matched by normalised path (forward slashes, lowercase drive letter, no trailing slash). Matched or Paseo-only worktrees carry Paseo's dirty / ahead / behind / status / diffStat at weight 1; git-only worktrees are weight 0.7 with zeroed git stats.
+- **Branches**: the branch checked out in a worktree hangs off it (`contains`, weight 1); every other local branch hangs off the repo (`branch-of`, weight 0.6). A branch name is never a node twice.
+- **Agents**: non-archived, non-closed agents attach to `wt:<workspaceId>`, falling back to a cwd path match; state is `error` → `error`, `requiresAttention` → `attention`, `running` → `executing`, else `idle`. Subagents only exist as events arrive and are dropped once their parent agent disappears.
+- **Scope**: `scope.workspaceId` narrows the graph to that workspace's project (the workspace panel); the hub is unscoped.
+
+Lifetime: `stop()` clears the recompute and poll timers, runs every observer unsubscribe, then calls `release()` on every `OwnedSubscription` it acquired (workspaces, agents, events). Subscriptions that resolve after `stop()` are released on arrival, so a surface unmounting mid-connect leaks nothing. `GraphView` keeps one `Graph` per component and runs the builder in an effect keyed by host / scope / data source; the Live ↔ Mock toggle stops the builder, empties the model, and either applies the fixture or restarts it.
 
 ### Wire vs model
 

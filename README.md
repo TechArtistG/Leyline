@@ -87,7 +87,8 @@ Leyline/
 │   ├── panel/               # WorkspacePanel: graph scoped to one worktree; native (iOS/Android) list fallback
 │   ├── renderer/            # web-only: GraphRenderer interface + impl(s); mode 2d | 3d | xr
 │   ├── web.ts               # Platform.OS === "web" gate; lazy require of WebGL deps, CSS injection
-│   └── mock/                # Phase 1 static fixtures
+│   ├── topology/            # Paseo directories + git RPC → Graph (client-side builder, diffed patches)
+│   └── mock/                # Phase 1 static fixtures (Live / Mock toggle in the control bar)
 ├── server/
 │   ├── topology/            # Paseo state → graph: hosts, repos, worktrees, agents, subagents, PRs
 │   ├── codegraph/           # repo → files/symbols/imports (tree-sitter or LSP client); cache + invalidation
@@ -180,9 +181,9 @@ Requirement: one data model driving 2D and 3D force-directed views, custom node 
 - [x] Leyline logo (directed "L"): `assets/icon.png` in the manifest, monochrome SVG (`client/logo.ts`) as the sidebar item and panel icon
 
 ### Phase 2: Live topology
-- [ ] `server/topology`: `workspaces.list` / `agents.list` subscriptions + `provider_subagents` events → `GraphPatch` stream over a plugin subscription
-- [ ] Agent state (Idle / Thinking / Executing), current tool/file from timeline `tool_call` items
-- [ ] Repo-root ↔ worktree, branch, ahead/behind, dirty, parent-agent edges
+- [x] `client/topology/builder.ts`: `workspaces.list` / `agents.list` subscriptions, `projects` directory, `provider_subagents` events → diffed `GraphPatch` into the `Graph` (client-side; no daemon stream needed since the renderer runs where `usePaseo()` lives)
+- [ ] Agent state: Thinking vs Executing, current tool/file from timeline `tool_call` items (today: Idle / Executing / Attention / Error from the agent snapshot)
+- [x] Repo-root ↔ worktree (union of Paseo workspaces and `git worktree list`), checked-out and local branches via `leyline.git.branches`, ahead/behind, dirty, parent-agent label
 - [ ] Click-through: `navigation.openAgent` / `openWorkspace`
 
 ### Phase 3: Interconnection & integration branch
