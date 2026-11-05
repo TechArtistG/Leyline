@@ -456,8 +456,86 @@ export function createGraphRenderer(
   const sphereGeometry = new THREE.SphereGeometry(1, 24, 16);
   const dodecahedronGeometry = new THREE.DodecahedronGeometry(1, 0);
   const dodecahedronClusterGeometry = buildDodecahedronCluster();
-  const geometryFor = (shape: NodeVisual["shape"]): Three.BufferGeometry =>
-    shape === "dodecahedron" ? dodecahedronGeometry : shape === "dodecahedron-cluster" ? dodecahedronClusterGeometry : sphereGeometry;
+  const dodecahedronFrameGeometry = buildDodecahedronFrame();
+  const shapeGeometries: Record<NodeVisual["shape"], Three.BufferGeometry> = {
+    sphere: sphereGeometry,
+    dodecahedron: dodecahedronGeometry,
+    "dodecahedron-cluster": dodecahedronClusterGeometry,
+    "dodecahedron-frame": dodecahedronFrameGeometry,
+  };
+  const geometryFor = (shape: NodeVisual["shape"]): Three.BufferGeometry => shapeGeometries[shape];
+
+  /** Concatenate non-indexed geometries, each transformed by its matrix, into one position+normal buffer. */
+  function mergeTransformed(parts: ReadonlyArray<{ geometry: Three.BufferGeometry; matrix: Three.Matrix4 }>): Three.BufferGeometry {
+    let total = 0;
+    for (const part of parts) total += part.geometry.getAttribute("position").count * 3;
+    const positions = new Float32Array(total);
+    const normals = new Float32Array(total);
+    const p = new THREE.Vector3();
+    const normalMatrix = new THREE.Matrix3();
+    let offset = 0;
+    for (const { geometry, matrix } of parts) {
+      const pos = geometry.getAttribute("position").array as Float32Array;
+      const nor = geometry.getAttribute("normal").array as Float32Array;
+      normalMatrix.getNormalMatrix(matrix);
+      for (let i = 0; i < pos.length; i += 3) {
+        p.set(pos[i], pos[i + 1], pos[i + 2]).applyMatrix4(matrix);
+        positions[offset + i] = p.x;
+        positions[offset + i + 1] = p.y;
+        positions[offset + i + 2] = p.z;
+        p.set(nor[i], nor[i + 1], nor[i + 2]).applyMatrix3(normalMatrix).normalize();
+        normals[offset + i] = p.x;
+        normals[offset + i + 1] = p.y;
+        normals[offset + i + 2] = p.z;
+      }
+      offset += pos.length;
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+    geometry.computeBoundingSphere();
+    return geometry;
+  }
+
+  /**
+   * A dodecahedron drawn as solid struts: a square-section bar along each of the 30 edges and a
+   * small dodecahedron knuckle at each of the 20 vertices. Vertices/edges are read from three's
+   * geometry (unique positions; edges = vertex pairs at the shortest non-zero distance).
+   */
+  function buildDodecahedronFrame(): Three.BufferGeometry {
+    const pos = dodecahedronGeometry.getAttribute("position").array as Float32Array;
+    const vertices: Three.Vector3[] = [];
+    for (let i = 0; i < pos.length; i += 3) {
+      const v = new THREE.Vector3(pos[i], pos[i + 1], pos[i + 2]);
+      if (!vertices.some((u) => u.distanceToSquared(v) < 1e-6)) vertices.push(v);
+    }
+    let edgeLength = Number.POSITIVE_INFINITY;
+    for (let a = 0; a < vertices.length; a++)
+      for (let b = a + 1; b < vertices.length; b++) edgeLength = Math.min(edgeLength, vertices[a].distanceTo(vertices[b]));
+    const strut = 0.07;
+    const bar = new THREE.BoxGeometry(strut, edgeLength, strut).toNonIndexed();
+    const knuckle = new THREE.DodecahedronGeometry(strut * 0.95, 0);
+    const parts: { geometry: Three.BufferGeometry; matrix: Three.Matrix4 }[] = [];
+    const up = new THREE.Vector3(0, 1, 0);
+    const dir = new THREE.Vector3();
+    const mid = new THREE.Vector3();
+    const q = new THREE.Quaternion();
+    const one = new THREE.Vector3(1, 1, 1);
+    for (let a = 0; a < vertices.length; a++) {
+      parts.push({ geometry: knuckle, matrix: new THREE.Matrix4().makeTranslation(vertices[a].x, vertices[a].y, vertices[a].z) });
+      for (let b = a + 1; b < vertices.length; b++) {
+        if (Math.abs(vertices[a].distanceTo(vertices[b]) - edgeLength) > 1e-4) continue;
+        dir.subVectors(vertices[b], vertices[a]).normalize();
+        mid.addVectors(vertices[a], vertices[b]).multiplyScalar(0.5);
+        q.setFromUnitVectors(up, dir);
+        parts.push({ geometry: bar, matrix: new THREE.Matrix4().compose(mid, q, one) });
+      }
+    }
+    const merged = mergeTransformed(parts);
+    bar.dispose();
+    knuckle.dispose();
+    return merged;
+  }
 
   /**
    * A central dodecahedron with one mated on each of its 12 faces. Faces come in parallel pairs, so
@@ -2519,6 +2597,7 @@ export function createGraphRenderer(
       sphereGeometry.dispose();
       dodecahedronGeometry.dispose();
       dodecahedronClusterGeometry.dispose();
+      dodecahedronFrameGeometry.dispose();
       ringGeometry.dispose();
       coneGeometry.dispose();
       agentRingGeometry.dispose();

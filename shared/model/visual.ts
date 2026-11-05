@@ -27,7 +27,7 @@ export interface NodeVisual {
   shape: NodeShape;
 }
 
-export const NODE_SHAPES = ["sphere", "dodecahedron", "dodecahedron-cluster"] as const;
+export const NODE_SHAPES = ["sphere", "dodecahedron", "dodecahedron-cluster", "dodecahedron-frame"] as const;
 export type NodeShape = (typeof NODE_SHAPES)[number];
 
 export interface ConnectorVisual {

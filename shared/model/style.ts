@@ -164,7 +164,7 @@ export const DEFAULT_STYLE: GraphStyle = {
   },
   nodes: {
     universe: { color: "border", emissive: 0.2, labelAlways: true, labelTier: "project" },
-    host: { color: "muted", labelAlways: true, labelTier: "project" },
+    host: { color: "muted", shape: "dodecahedron-frame", size: 1.3, labelAlways: true, labelTier: "project" },
     repo: { color: "muted", colorByLabel: true, shape: "dodecahedron-cluster", labelAlways: true, labelTier: "project" },
     branch: {
       color: "border",
