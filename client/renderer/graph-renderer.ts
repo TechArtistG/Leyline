@@ -11,8 +11,8 @@ import type { GraphEvent, GraphHandle, GraphMode } from "../../shared/graph";
 import type { Connector } from "../../shared/model/connector";
 import type { Graph, GraphChange } from "../../shared/model/graph";
 import type { GraphNode } from "../../shared/model/node";
-import { AgentNode } from "../../shared/model/nodes";
-import { type GraphStyle, StyleResolver } from "../../shared/model/style";
+import { AgentNode, SubagentNode } from "../../shared/model/nodes";
+import { type GraphStyle, type LabelAnchor, StyleResolver } from "../../shared/model/style";
 import type {
   AgentRingVisual,
   ColorRef,
@@ -21,7 +21,7 @@ import type {
   LabelSettings,
   NodeVisual,
 } from "../../shared/model/visual";
-import { type ConnectorKind, TREE_CONNECTOR_KINDS } from "../../shared/model/wire";
+import { type ConnectorKind, SUBAGENT_STATES, type SubagentState, TREE_CONNECTOR_KINDS } from "../../shared/model/wire";
 import {
   type Cluster,
   type ClusterAxes,
@@ -81,8 +81,9 @@ export interface RendererLibs {
 
 /**
  * Position holder for one node, keyed by id and kept across model updates. Web nodes are d3
- * simulation nodes; spider nodes reuse the shape (so lines, labels and fit read one field set)
- * but are never handed to the simulation — their x/y/z are computed from their anchor each frame.
+ * simulation nodes; spider nodes reuse the shape only for `clusterId`/`lod` (their labels scale
+ * with their anchor's cluster) — they are never simulated or positioned, since agentic work is
+ * drawn as ring/spoke modifiers on the anchor rather than as nodes.
  */
 interface SimNode extends D3.SimulationNode {
   id: string;
@@ -105,27 +106,29 @@ interface NodeEntry {
   visual: NodeVisual;
   /** `node.revision` the visual was resolved from; equal → the update was a no-op for us. */
   revision: number;
-  /** Spider only: the anchor the current placement is based on; differs from `node.anchorId` → tween. */
+  /** Spider only: the anchor the ring/spoke placement is based on; differs from `node.anchorId` → re-index. */
   anchorId: string | undefined;
-  /** Spider only: straight-line move from the old anchor to the new one. */
-  tween: { from: Point; start: number } | null;
-  /** Spider only: frame stamp of the last placement, so anchor chains resolve once per frame. */
-  placedFrame: number;
-  /** Null while `visual.hidden`: not drawn, not picked, not simulated. Ring and label follow it. */
+  /** Not `visual.hidden`. Web: has a mesh, is simulated and picked. Spider: eligible for a ring/spoke on its anchor. */
+  shown: boolean;
+  /** Spider only: currently drawn as a ring or spoke (its anchor chain resolves to a shown web node); the label needs it. */
+  placed: boolean;
+  /** Web only; null while hidden. Ring and label follow it. */
   mesh: Three.Mesh<Three.SphereGeometry, Three.MeshStandardMaterial> | null;
   ring: Three.Mesh<Three.TorusGeometry, Three.MeshBasicMaterial> | null;
+  /** Web: `labelAlways`/LOD or hover/select. Spider: hover/select only, laid out at its ring top or tip. */
   label: Label | null;
 }
 interface ConnectorEntry {
   connector: Connector;
   link: SimLink;
-  /** Both endpoints are shown web nodes → the link is a simulation force; otherwise only drawn. */
-  simulated: boolean;
-  /** Hidden endpoints hide the connector; `contains` into a spider is not drawn either: the spider already sits on its anchor. */
-  drawn: boolean;
+  /**
+   * Both endpoints are shown web nodes: the connector is drawn and is a simulation force. A
+   * connector touching a spider is neither — agentic work renders as ring/spoke modifiers.
+   */
+  active: boolean;
   visual: ConnectorVisual;
   revision: number;
-  /** Arrowhead at the target when `visual.directed`, single-lane and drawn. */
+  /** Arrowhead at the target when `visual.directed`, single-lane and active. */
   cone: Three.Mesh<Three.ConeGeometry, Three.MeshBasicMaterial> | null;
 }
 /**
@@ -185,16 +188,35 @@ interface LineGroup {
   velocity: number;
   entries: ConnectorEntry[];
 }
-/** One concentric ring around a worktree for one anchored agent; dashed + spinning while that agent executes. */
+/**
+ * One radial spoke on an agent ring for one subagent: a solid line from the ring outward, ending
+ * in a small ring tip (dashed + spinning while the subagent runs). Both live in the ring's group.
+ */
+interface Spoke {
+  entry: NodeEntry;
+  state: SubagentState;
+  tipRadius: number;
+  line: Line2Module.Line2;
+  tip: Line2Module.Line2;
+}
+/**
+ * One concentric ring around a worktree for one anchored agent; dashed + spinning while that agent
+ * executes. `group` is the ring plane (billboarded in 3D): the ring line, spokes and tips are its
+ * children, so the spin never moves the spokes.
+ */
 interface AgentRing {
-  agentId: string;
+  entry: NodeEntry;
   executing: boolean;
   radius: number;
+  group: Three.Group;
   line: Line2Module.Line2;
+  spokes: Spoke[];
 }
 /** All agent rings of one web node, in sorted agent id order (index = ring slot from the inside out). */
 interface AgentRingSet {
   entry: NodeEntry;
+  /** Reconcile key: spoke length, tip radius, then per agent `(id, executing, ring radius)` and per subagent `(id, state)`. */
+  key: string;
   rings: AgentRing[];
 }
 interface Point {
@@ -266,15 +288,25 @@ const MARCH_DT_MAX = 0.1;
 /** Agent rings: polyline resolution, dash count per executing ring (dash and gap each 1/24 of the circumference). */
 const AGENT_RING_SEGMENTS = 64;
 const AGENT_RING_DASHES = 12;
+/** Dash count per running spoke tip: fewer than the ring's so they stay readable at tip size. */
+const TIP_DASHES = 4;
 /** Rings draw after the connector batches (also transparent, order 0) so they are never cut by a line. */
 const AGENT_RING_RENDER_ORDER = 1;
+/** Subagent spokes spread over at least this many angle slots, so a lone spoke sits at the top and a few stay well apart. */
+const SPOKE_MIN_SLOTS = 6;
+/** Running tip pulse: scale swings between 1 and 1 + this. */
+const TIP_PULSE = 0.25;
+/** Extra screen-space hit width when picking fat lines (rings, tips), px either side of the line width. */
+const PICK_LINE_THRESHOLD_PX = 6;
+/** Spoke and tip colour per subagent state; `null` = the ring colour (tip lightened by `spokeLighten`). */
+const SPOKE_STATE_COLOR: Record<SubagentState, ColorRef | null> = {
+  running: null,
+  completed: "muted",
+  failed: "danger",
+  canceled: "border",
+};
 const SELECT_EMISSIVE = 0.5;
 const HOVER_EMISSIVE = 0.2;
-/** Spider ring radius = anchor radius + spider radius × this. */
-const SPIDER_ORBIT = 1.8;
-/** Tilt of the spider ring out of the XY plane in `3d-hub`, radians. */
-const SPIDER_TILT_3D = 0.45;
-const SPIDER_TWEEN_MS = 600;
 
 const ROLE_THEME_KEY: Record<ColorRole, "accent" | "statusSuccess" | "statusWarning" | "statusDanger" | "foregroundMuted" | "foreground" | "border"> = {
   accent: "accent",
@@ -469,8 +501,8 @@ export function createGraphRenderer(
     batch.material.dispose();
   }
 
-  // Agent rings: a unit circle polyline shared by every ring (scaled per ring; screen-space width is
-  // scale-independent) and two shared materials, solid and dashed. Dash distances are static in the
+  // Agent glyphs (rings, spokes, tips): a unit circle polyline shared by every ring and tip (scaled
+  // per object; screen-space width is scale-independent). Dash distances are static in the
   // geometry's unit space, so one dash/gap size tiles every ring regardless of radius.
   const agentRingGeometry = new LineGeometry();
   const agentRingChord = 2 * Math.sin(Math.PI / AGENT_RING_SEGMENTS);
@@ -490,31 +522,81 @@ export function createGraphRenderer(
     }
     attachLineDistances(agentRingGeometry, distances, THREE.StaticDrawUsage);
   }
-  function createAgentRingMaterial(dashed: boolean): LineMaterialModule.LineMaterial {
+  /** Tip dash length in the unit circle's space: `TIP_DASHES` dashes per tip circumference. */
+  const tipDash = agentRingDash * (AGENT_RING_DASHES / TIP_DASHES);
+  /** Every glyph material, for the resize/restyle/dispose sweeps that must treat them all alike. */
+  const glyphMaterials: LineMaterialModule.LineMaterial[] = [];
+  /**
+   * All glyph materials come from here so that solid and dashed variants differ in nothing but
+   * `dashed`/`dashSize`/`gapSize`: same `linewidth` (restyled together), `resolution` (resized
+   * together), opacity, `alphaToCoverage`, `dashScale` and depth settings. The only remaining
+   * difference is in the shader itself, which discards the round endcaps of dashed segments.
+   */
+  function createGlyphMaterial(dashed: boolean, dash: number): LineMaterialModule.LineMaterial {
     const material = new LineMaterial({
       linewidth: agentRingStyle.width,
       worldUnits: false,
       dashed,
-      dashSize: agentRingDash,
-      gapSize: agentRingDash,
+      dashScale: 1,
+      dashSize: dash,
+      gapSize: dash,
+      opacity: 1,
       transparent: true,
       alphaToCoverage: true,
       depthTest: true,
       depthWrite: false,
       toneMapped: false,
     });
-    material.color.copy(colorFor(agentRingStyle.color));
     material.resolution.set(width, height);
+    glyphMaterials.push(material);
     return material;
   }
-  const agentRingSolidMaterial = createAgentRingMaterial(false);
-  const agentRingDashedMaterial = createAgentRingMaterial(true);
+  /** Agent ring materials indexed `[selected ? 1 : 0][executing ? 1 : 0]`; selected ones are `selection.widthScale` wider. */
+  const ringMaterials = [
+    [createGlyphMaterial(false, agentRingDash), createGlyphMaterial(true, agentRingDash)],
+    [createGlyphMaterial(false, agentRingDash), createGlyphMaterial(true, agentRingDash)],
+  ];
+  /** Spoke line per subagent state: always solid, state-coloured (`SPOKE_STATE_COLOR`). */
+  const spokeMaterials: Record<SubagentState, LineMaterialModule.LineMaterial> = {
+    running: createGlyphMaterial(false, agentRingDash),
+    completed: createGlyphMaterial(false, agentRingDash),
+    failed: createGlyphMaterial(false, agentRingDash),
+    canceled: createGlyphMaterial(false, agentRingDash),
+  };
+  /** Tip ring per subagent state: dashed (and spun per frame) while running, solid otherwise. */
+  const tipMaterials: Record<SubagentState, LineMaterialModule.LineMaterial> = {
+    running: createGlyphMaterial(true, tipDash),
+    completed: createGlyphMaterial(false, tipDash),
+    failed: createGlyphMaterial(false, tipDash),
+    canceled: createGlyphMaterial(false, tipDash),
+  };
+
+  /** Apply the agent-ring style (width, colours, selection width) to every glyph material. */
+  function restyleGlyphMaterials(): void {
+    const ringColor = colorFor(agentRingStyle.color);
+    for (const material of glyphMaterials) {
+      material.linewidth = agentRingStyle.width;
+      material.color.copy(ringColor);
+    }
+    for (const material of ringMaterials[1]) material.linewidth = agentRingStyle.width * selectionStyle.widthScale;
+    for (const state of SUBAGENT_STATES) {
+      const ref = SPOKE_STATE_COLOR[state];
+      if (ref === null) continue;
+      spokeMaterials[state].color.copy(colorFor(ref));
+      tipMaterials[state].color.copy(colorFor(ref));
+    }
+    tipMaterials.running.color.copy(ringColor).lerp(foreground, agentRingStyle.spokeLighten);
+  }
+  restyleGlyphMaterials();
   /** Web node id → its agent rings. */
   const agentRingSets = new Map<string, AgentRingSet>();
   /** Set by node restyles (agent state, anchor radius); cleared by `rebuildAgentRings`. */
   let agentRingsDirty = false;
-  const agentRingSpin = new THREE.Quaternion();
   const agentRingAxis = new THREE.Vector3(0, 0, 1);
+  /** Scratch: world position of a ring top / spoke tip for its label. */
+  const glyphTmp = new THREE.Vector3();
+  /** Everything the pointer can hit: web node meshes, agent ring lines and spoke tip rings, each carrying `userData.id`. */
+  const pickables: Three.Object3D[] = [];
 
   // ---- camera / controls ---------------------------------------------------------------------
   let mode: GraphMode = initialMode;
@@ -570,10 +652,10 @@ export function createGraphRenderer(
       camera.updateProjectionMatrix();
     }
     // Screen-space line widths are computed against the viewport; `LineSegments2.onBeforeRender`
-    // refreshes this too, but only for objects that render, so keep every material current.
+    // refreshes this too, but only for objects that render, so keep every material current
+    // (picking reads it too, and solid/dashed glyphs must agree).
     for (const batch of lineBatchList) batch.material.resolution.set(w, h);
-    agentRingSolidMaterial.resolution.set(w, h);
-    agentRingDashedMaterial.resolution.set(w, h);
+    for (const material of glyphMaterials) material.resolution.set(w, h);
   }
   const resizeObserver = new ResizeObserver(([entry]) => {
     resize(Math.max(1, entry.contentRect.width), Math.max(1, entry.contentRect.height));
@@ -585,7 +667,6 @@ export function createGraphRenderer(
   const connectorEntries = new Map<string, ConnectorEntry>();
   let nodeList: SimNode[] = [];
   let linkList: SimLink[] = [];
-  let meshes: Three.Object3D[] = [];
   /** Jitter source for spawn offsets and 3D inflation; reseeded by `relayout()`. */
   let rng = lcg(SEED);
 
@@ -645,7 +726,7 @@ export function createGraphRenderer(
     return result;
   }
 
-  /** Reassign every node's cluster and rebuild the cluster list (members: shown web nodes; extent: plus their spiders). */
+  /** Reassign every node's cluster and rebuild the cluster list (members and extent: shown web nodes; spiders only take a cluster for their label LOD). */
   function rebuildClusters(): void {
     const memo = new Map<string, string>();
     clusterById.clear();
@@ -672,16 +753,14 @@ export function createGraphRenderer(
     }
     for (const e of entries.values()) {
       if (e.node.layer !== "spider") continue;
-      // Follow the anchor chain to a shown web node; a spider that resolves to nothing is not drawn.
+      // Follow the anchor chain to a shown web node, so the spider's label scales with that cluster.
       let anchor: NodeEntry | undefined = e;
       let hops = 0;
-      while (anchor && anchor.node.layer === "spider" && anchor.mesh && hops++ <= entries.size) {
+      while (anchor && anchor.node.layer === "spider" && anchor.shown && hops++ <= entries.size) {
         anchor = anchor.anchorId !== undefined ? entries.get(anchor.anchorId) : undefined;
       }
-      const web = anchor?.node.layer === "web" && anchor.mesh ? anchor : undefined;
-      e.sim.clusterId = web ? web.sim.clusterId : ROOT_CLUSTER;
+      e.sim.clusterId = anchor?.mesh ? anchor.sim.clusterId : ROOT_CLUSTER;
       e.sim.lod = lodFor(e.sim.clusterId);
-      if (web && e.mesh) clusterFor(e.sim.clusterId).extent.push(e.sim);
     }
     clusters = [...clusterById.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     clusterLods.length = 0;
@@ -829,16 +908,11 @@ export function createGraphRenderer(
   /** Push the current web node/link lists into the simulation and rebuild dependent buffers. */
   function syncSimulation(): void {
     nodeList = [];
-    meshes = [];
-    for (const e of entries.values()) {
-      if (!e.mesh) continue;
-      if (e.node.layer === "web") nodeList.push(e.sim);
-      meshes.push(e.mesh);
-    }
+    for (const e of entries.values()) if (e.mesh) nodeList.push(e.sim);
     linkList = [];
     for (const e of connectorEntries.values()) {
       classifyConnector(e);
-      if (e.simulated) linkList.push(e.link);
+      if (e.active) linkList.push(e.link);
     }
     rebuildAnchorIndex();
     rebuildClusters();
@@ -851,18 +925,15 @@ export function createGraphRenderer(
   }
 
   // ---- spiders -------------------------------------------------------------------------------
-  /** Anchor id → ids of the spiders riding on it, in stable (sorted) order; drives ring slots. */
+  /** Anchor id → ids of the shown spiders riding on it, in stable (sorted) order; drives ring and spoke slots. */
   const anchoredBy = new Map<string, string[]>();
-  let frame = 0;
-  /** Timestamp of the last animation frame; tweens started between frames use it as their origin. */
+  /** Timestamp of the last animation frame, for the dash march delta. */
   let lastFrameTime = 0;
-  /** Set when a spider's position changed this frame, so hulls (which include spiders) refresh. */
-  let spiderMoved = false;
 
   function rebuildAnchorIndex(): void {
     anchoredBy.clear();
     for (const e of entries.values()) {
-      if (e.anchorId === undefined || !e.mesh) continue;
+      if (e.anchorId === undefined || !e.shown) continue;
       let list = anchoredBy.get(e.anchorId);
       if (!list) anchoredBy.set(e.anchorId, (list = []));
       list.push(e.node.id);
@@ -871,66 +942,8 @@ export function createGraphRenderer(
     rebuildAgentRings();
   }
 
-  function spiderVisible(entry: NodeEntry, visible: boolean): void {
-    if (!entry.mesh) return;
-    entry.mesh.visible = visible;
-    if (entry.ring) entry.ring.visible = visible;
-    if (entry.label) entry.label.sprite.visible = visible && labelVisible(entry);
-  }
-
-  /**
-   * Compute a spider's position for this frame: its ring slot around the anchor (anchor chains
-   * resolve recursively, once per frame), blended from the previous anchor while a tween runs.
-   */
-  function placeSpider(entry: NodeEntry, time: number): void {
-    if (entry.placedFrame === frame || !entry.mesh) return;
-    entry.placedFrame = frame;
-    const anchor = entry.anchorId !== undefined ? entries.get(entry.anchorId) : undefined;
-    if (!anchor) {
-      spiderVisible(entry, false);
-      return;
-    }
-    if (anchor.node.layer === "spider") placeSpider(anchor, time);
-    if (!anchor.mesh?.visible) {
-      spiderVisible(entry, false);
-      return;
-    }
-    spiderVisible(entry, true);
-    const slots = anchoredBy.get(anchor.node.id);
-    const count = slots?.length ?? 1;
-    const index = slots?.indexOf(entry.node.id) ?? 0;
-    const angle = Math.PI / 2 + (index / count) * Math.PI * 2;
-    const r = anchor.visual.radius + entry.visual.radius * SPIDER_ORBIT;
-    const tilt = mode === "3d-hub" ? SPIDER_TILT_3D : 0;
-    const ax = anchor.sim.x ?? 0;
-    const ay = anchor.sim.y ?? 0;
-    const az = anchor.sim.z ?? 0;
-    let x = ax + Math.cos(angle) * r;
-    let y = ay + Math.sin(angle) * r * Math.cos(tilt);
-    let z = az + Math.sin(angle) * r * Math.sin(tilt);
-    const tween = entry.tween;
-    if (tween) {
-      const t = (time - tween.start) / SPIDER_TWEEN_MS;
-      if (t >= 1) {
-        entry.tween = null;
-      } else {
-        const s = t * t * (3 - 2 * t);
-        x = tween.from.x + (x - tween.from.x) * s;
-        y = tween.from.y + (y - tween.from.y) * s;
-        z = tween.from.z + (z - tween.from.z) * s;
-      }
-    }
-    if (entry.sim.x !== x || entry.sim.y !== y || entry.sim.z !== z) spiderMoved = true;
-    entry.sim.x = x;
-    entry.sim.y = y;
-    entry.sim.z = z;
-  }
-
-  /** Spider anchor moved in the model: remember where it is now and slide to the new slot. */
-  function retargetSpider(entry: NodeEntry, now: number): void {
-    if (entry.sim.x !== undefined && entry.mesh?.visible) {
-      entry.tween = { from: { x: entry.sim.x, y: entry.sim.y ?? 0, z: entry.sim.z ?? 0 }, start: now };
-    }
+  /** Spider anchor moved in the model: re-index so its ring/spoke lands on the new anchor. */
+  function retargetSpider(entry: NodeEntry): void {
     entry.anchorId = entry.node.anchorId;
     rebuildAnchorIndex();
     rebuildClusters();
@@ -940,15 +953,20 @@ export function createGraphRenderer(
   let selectedId: string | null = null;
   let hoveredId: string | null = null;
 
-  /** Hover/select always show; otherwise `labelAlways`, gated by the node's cluster zoom LOD for `all`-tier labels. */
+  /**
+   * Hover/select always show; otherwise `labelAlways`, gated by the node's cluster zoom LOD for
+   * `all`-tier labels. Spiders are ring/spoke modifiers: their label is a hover/select affordance only.
+   */
   function labelVisible(entry: NodeEntry): boolean {
     const id = entry.node.id;
     if (id === selectedId || id === hoveredId) return true;
+    if (entry.node.layer === "spider") return false;
     return entry.visual.labelAlways && (entry.sim.lod.lodAll || entry.visual.labelTier === "project");
   }
 
   function refreshLabel(entry: NodeEntry): void {
-    if (!entry.mesh || !labelVisible(entry)) {
+    const drawn = entry.node.layer === "web" ? entry.mesh !== null : entry.placed;
+    if (!drawn || !labelVisible(entry)) {
       if (entry.label) entry.label.sprite.visible = false;
       return;
     }
@@ -994,12 +1012,11 @@ export function createGraphRenderer(
     entry.ring.scale.setScalar(entry.visual.radius * RING_SCALE);
   }
 
-  /** Give a shown node its sphere; web nodes without a position start near an anchor so they do not fly in from the origin. */
+  /** Give a shown web node its sphere; nodes without a position start near an anchor so they do not fly in from the origin. */
   function mountNode(entry: NodeEntry): void {
     const { node, sim, visual } = entry;
-    // Without an anchor, leave the position undefined and let d3's deterministic phyllotaxis
-    // placement handle it. Spiders are placed from their anchor every frame.
-    const anchor = node.layer === "web" && sim.x === undefined ? anchorFor(node) : null;
+    // Without an anchor, leave the position undefined and let d3's deterministic phyllotaxis placement handle it.
+    const anchor = sim.x === undefined ? anchorFor(node) : null;
     if (anchor) {
       const angle = rng() * Math.PI * 2;
       const r = SPAWN_RADIUS * (0.5 + rng() * 0.5);
@@ -1031,22 +1048,26 @@ export function createGraphRenderer(
 
   /**
    * Re-resolve a node's visual and apply every dependent piece (scale, material, ring, label).
-   * Returns true when `hidden` flipped: the node entered or left the drawn/simulated set.
+   * Returns true when `hidden` flipped: the node entered or left the shown set (web: drawn and
+   * simulated; spider: eligible for a ring/spoke).
    */
   function restyleNode(entry: NodeEntry): boolean {
     entry.visual = resolver.nodeVisual(entry.node);
     entry.revision = entry.node.revision;
     entry.sim.radius = entry.visual.radius;
-    const flipped = entry.visual.hidden === (entry.mesh !== null);
+    const flipped = entry.visual.hidden === entry.shown;
     if (flipped) {
-      if (entry.mesh) unmountNode(entry);
-      else mountNode(entry);
+      entry.shown = !entry.visual.hidden;
+      if (entry.node.layer === "web") {
+        if (entry.shown) mountNode(entry);
+        else unmountNode(entry);
+      }
     }
     if (entry.mesh) entry.mesh.scale.setScalar(entry.visual.radius);
     refreshMaterial(entry);
     refreshRing(entry);
     refreshLabel(entry);
-    if (entry.anchorId !== entry.node.anchorId) retargetSpider(entry, lastFrameTime);
+    if (entry.anchorId !== entry.node.anchorId) retargetSpider(entry);
     // Agent state (dashed/spinning ring) and anchor radius (ring radii) both feed the agent rings.
     agentRingsDirty = true;
     return flipped;
@@ -1085,13 +1106,13 @@ export function createGraphRenderer(
       visual,
       revision: node.revision,
       anchorId: node.anchorId,
-      tween: null,
-      placedFrame: -1,
+      shown: !visual.hidden,
+      placed: false,
       mesh: null,
       ring: null,
       label: null,
     };
-    if (!visual.hidden) mountNode(entry);
+    if (entry.shown && node.layer === "web") mountNode(entry);
     refreshMaterial(entry);
     refreshRing(entry);
     refreshLabel(entry);
@@ -1108,7 +1129,7 @@ export function createGraphRenderer(
 
   function refreshCone(entry: ConnectorEntry): void {
     // Two-lane connectors are undirected by construction: a cone would sit between the lanes.
-    if (!entry.visual.directed || entry.visual.lanes === 2 || !entry.drawn) {
+    if (!entry.visual.directed || entry.visual.lanes === 2 || !entry.active) {
       if (entry.cone) {
         scene.remove(entry.cone);
         entry.cone.material.dispose();
@@ -1148,14 +1169,11 @@ export function createGraphRenderer(
     return entry.visual.width * (isSelectedConnector(entry) ? selectionStyle.widthScale : 1);
   }
 
-  /** Hidden endpoints hide a connector entirely; shown web↔web links are simulated as well as drawn. */
+  /** Both endpoints shown web nodes → drawn and simulated; a hidden endpoint or a spider endpoint drops the connector. */
   function classifyConnector(entry: ConnectorEntry): void {
     const source = entries.get(entry.connector.source);
     const target = entries.get(entry.connector.target);
-    const shown = source !== undefined && target !== undefined && source.mesh !== null && target.mesh !== null;
-    const web = shown && source.node.layer === "web" && target.node.layer === "web";
-    entry.simulated = web;
-    entry.drawn = shown && (web || entry.connector.kind !== "contains");
+    entry.active = source !== undefined && target !== undefined && source.mesh !== null && target.mesh !== null;
     refreshCone(entry);
   }
 
@@ -1163,8 +1181,7 @@ export function createGraphRenderer(
     const entry: ConnectorEntry = {
       connector,
       link: { id: connector.id, kind: connector.kind, distance: connector.distance, source: source.sim, target: target.sim },
-      simulated: false,
-      drawn: false,
+      active: false,
       visual: resolver.connectorVisual(connector),
       revision: connector.revision,
       cone: null,
@@ -1204,7 +1221,7 @@ export function createGraphRenderer(
   function rebuildLineBuffers(): void {
     const grouped = new Map<string, LineGroup>();
     for (const e of connectorEntries.values()) {
-      if (!e.drawn) continue;
+      if (!e.active) continue;
       const width = connectorWidth(e);
       // Only dashed lines can march: a solid line's dash offset is never read.
       const speed = e.visual.dashed ? e.visual.marchSpeed : 0;
@@ -1338,65 +1355,20 @@ export function createGraphRenderer(
   }
 
   // ---- agent rings ---------------------------------------------------------------------------
-  function disposeAgentRingSet(set: AgentRingSet): void {
-    for (const ring of set.rings) scene.remove(ring.line);
+  /** A spider leaves the drawn set: its label (hover/select) goes with it. */
+  function unplace(entry: NodeEntry): void {
+    entry.placed = false;
+    refreshLabel(entry);
   }
 
-  /**
-   * Reconcile the ring sets with the anchored-spider index: one set per shown web node that has
-   * anchored `agent` spiders, one ring per agent in sorted id order, concentric from
-   * `radius × innerScale` outward by `spacing`. A set is only rebuilt when its agents, their
-   * executing flags or the radii differ from what is drawn, so state changes are cheap and
-   * untouched rings keep their objects. Runs after `rebuildAnchorIndex` and after node restyles.
-   */
-  function rebuildAgentRings(): void {
-    agentRingsDirty = false;
-    const keep = new Set<string>();
-    if (agentRingStyle.show) {
-      for (const [anchorId, spiderIds] of anchoredBy) {
-        const anchor = entries.get(anchorId);
-        if (!anchor?.mesh || anchor.node.layer !== "web") continue;
-        const existing = agentRingSets.get(anchorId);
-        const prior = existing?.entry === anchor ? existing : undefined;
-        let count = 0;
-        let same = prior !== undefined;
-        for (const id of spiderIds) {
-          const spider = entries.get(id);
-          if (!spider?.mesh || !(spider.node instanceof AgentNode)) continue;
-          if (same) {
-            const ring = prior?.rings[count];
-            same =
-              ring !== undefined &&
-              ring.agentId === id &&
-              ring.executing === (spider.node.state === "executing") &&
-              ring.radius === agentRingRadius(anchor, count);
-          }
-          count++;
-        }
-        if (count === 0) continue;
-        keep.add(anchorId);
-        if (same && prior?.rings.length === count) continue;
-        if (existing) disposeAgentRingSet(existing);
-        const set: AgentRingSet = { entry: anchor, rings: [] };
-        for (const id of spiderIds) {
-          const spider = entries.get(id);
-          if (!spider?.mesh || !(spider.node instanceof AgentNode)) continue;
-          const executing = spider.node.state === "executing";
-          const radius = agentRingRadius(anchor, set.rings.length);
-          const line = new Line2(agentRingGeometry, executing ? agentRingDashedMaterial : agentRingSolidMaterial);
-          line.frustumCulled = false;
-          line.renderOrder = AGENT_RING_RENDER_ORDER;
-          line.scale.setScalar(radius);
-          scene.add(line);
-          set.rings.push({ agentId: id, executing, radius, line });
-        }
-        agentRingSets.set(anchorId, set);
+  function disposeAgentRingSet(set: AgentRingSet): void {
+    for (const ring of set.rings) {
+      scene.remove(ring.group);
+      for (const spoke of ring.spokes) {
+        spoke.line.geometry.dispose();
+        unplace(spoke.entry);
       }
-    }
-    for (const [anchorId, set] of agentRingSets) {
-      if (keep.has(anchorId)) continue;
-      disposeAgentRingSet(set);
-      agentRingSets.delete(anchorId);
+      unplace(ring.entry);
     }
   }
 
@@ -1404,33 +1376,215 @@ export function createGraphRenderer(
     return anchor.visual.radius * agentRingStyle.innerScale + slot * agentRingStyle.spacing;
   }
 
-  /** Style change: shared materials take the new width/colour; radii and `show` go through the reconcile. */
-  function restyleAgentRings(): void {
-    for (const material of [agentRingSolidMaterial, agentRingDashedMaterial]) {
-      material.linewidth = agentRingStyle.width;
-      material.color.copy(colorFor(agentRingStyle.color));
+  /** Shown `agent` spider anchored to a web node, else undefined. */
+  function agentSpider(id: string): NodeEntry | undefined {
+    const entry = entries.get(id);
+    return entry?.shown && entry.node instanceof AgentNode ? entry : undefined;
+  }
+
+  /** Shown `subagent` spider anchored to an agent, else undefined. */
+  function subagentSpider(id: string): NodeEntry | undefined {
+    const entry = entries.get(id);
+    return entry?.shown && entry.node instanceof SubagentNode ? entry : undefined;
+  }
+
+  function ringMaterial(agentId: string, executing: boolean): LineMaterialModule.LineMaterial {
+    return ringMaterials[agentId === selectedId ? 1 : 0][executing ? 1 : 0];
+  }
+
+  /**
+   * Reconcile the ring sets with the anchored-spider index: one set per shown web node that has
+   * anchored `agent` spiders, one ring per agent in sorted id order, concentric from
+   * `radius × innerScale` outward by `spacing`, and on each ring one spoke per `subagent` anchored
+   * to that agent in sorted id order. A set is rebuilt only when its reconcile key (`AgentRingSet.key`)
+   * differs from what is drawn, so state changes are cheap and untouched sets keep their objects.
+   * Runs after `rebuildAnchorIndex` and after node restyles; refreshes the pickable list.
+   */
+  function rebuildAgentRings(): void {
+    agentRingsDirty = false;
+    const keep = new Set<string>();
+    if (agentRingStyle.show) {
+      for (const [anchorId, spiderIds] of anchoredBy) {
+        const anchor = entries.get(anchorId);
+        if (!anchor?.mesh) continue;
+        const spokeLength = anchor.visual.radius * agentRingStyle.spokeScale;
+        const tipRadius = anchor.visual.radius * agentRingStyle.spokeTipScale;
+        let key = `${spokeLength}|${tipRadius}`;
+        let count = 0;
+        for (const id of spiderIds) {
+          const agent = agentSpider(id);
+          if (!agent) continue;
+          key += `;${id}|${(agent.node as AgentNode).state === "executing" ? 1 : 0}|${agentRingRadius(anchor, count++)}`;
+          const subIds = anchoredBy.get(id);
+          if (!subIds) continue;
+          for (const subId of subIds) {
+            const sub = subagentSpider(subId);
+            if (sub) key += `,${subId}|${(sub.node as SubagentNode).state}`;
+          }
+        }
+        if (count === 0) continue;
+        keep.add(anchorId);
+        const existing = agentRingSets.get(anchorId);
+        if (existing && existing.entry === anchor && existing.key === key) continue;
+        if (existing) disposeAgentRingSet(existing);
+        agentRingSets.set(anchorId, createAgentRingSet(anchor, spiderIds, key, spokeLength, tipRadius));
+      }
     }
+    for (const [anchorId, set] of agentRingSets) {
+      if (keep.has(anchorId)) continue;
+      disposeAgentRingSet(set);
+      agentRingSets.delete(anchorId);
+    }
+    rebuildPickables();
+  }
+
+  function createAgentRingSet(anchor: NodeEntry, spiderIds: string[], key: string, spokeLength: number, tipRadius: number): AgentRingSet {
+    const set: AgentRingSet = { entry: anchor, key, rings: [] };
+    for (const id of spiderIds) {
+      const agent = agentSpider(id);
+      if (!agent) continue;
+      const executing = (agent.node as AgentNode).state === "executing";
+      const radius = agentRingRadius(anchor, set.rings.length);
+      const group = new THREE.Group();
+      const line = new Line2(agentRingGeometry, ringMaterial(id, executing));
+      line.frustumCulled = false;
+      line.renderOrder = AGENT_RING_RENDER_ORDER;
+      line.scale.setScalar(radius);
+      line.userData.id = id;
+      group.add(line);
+      const ring: AgentRing = { entry: agent, executing, radius, group, line, spokes: [] };
+      const subIds = anchoredBy.get(id);
+      if (subIds) {
+        let slots = 0;
+        for (const subId of subIds) if (subagentSpider(subId)) slots++;
+        slots = Math.max(slots, SPOKE_MIN_SLOTS);
+        for (const subId of subIds) {
+          const sub = subagentSpider(subId);
+          if (sub) ring.spokes.push(createSpoke(ring, sub, spokeLength, tipRadius, ring.spokes.length, slots));
+        }
+      }
+      scene.add(group);
+      agent.placed = true;
+      refreshLabel(agent);
+      set.rings.push(ring);
+    }
+    return set;
+  }
+
+  /**
+   * Spoke `index` of `slots` on `ring`, in the ring's local plane: a radial line from the ring
+   * outward by `spokeLength`, angle `π/2 + index × 2π/slots` (slot 0 at the top; fixed, the ring's
+   * spin is on the ring line only), ending in a tip ring of `tipRadius`.
+   */
+  function createSpoke(ring: AgentRing, entry: NodeEntry, spokeLength: number, tipRadius: number, index: number, slots: number): Spoke {
+    const state = (entry.node as SubagentNode).state;
+    const angle = Math.PI / 2 + (index / slots) * Math.PI * 2;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const outer = ring.radius + spokeLength;
+    const geometry = new LineGeometry();
+    geometry.setPositions([cos * ring.radius, sin * ring.radius, 0, cos * outer, sin * outer, 0]);
+    const line = new Line2(geometry, spokeMaterials[state]);
+    line.frustumCulled = false;
+    line.renderOrder = AGENT_RING_RENDER_ORDER;
+    const tip = new Line2(agentRingGeometry, tipMaterials[state]);
+    tip.frustumCulled = false;
+    tip.renderOrder = AGENT_RING_RENDER_ORDER;
+    tip.position.set(cos * outer, sin * outer, 0);
+    tip.scale.setScalar(tipRadius);
+    tip.userData.id = entry.node.id;
+    ring.group.add(line, tip);
+    entry.placed = true;
+    refreshLabel(entry);
+    return { entry, state, tipRadius, line, tip };
+  }
+
+  /** Web node meshes first (nearest hit wins), then tips before rings so a tip crossing an outer ring picks as the tip on ties. */
+  function rebuildPickables(): void {
+    pickables.length = 0;
+    for (const e of entries.values()) if (e.mesh) pickables.push(e.mesh);
+    for (const set of agentRingSets.values()) {
+      for (const ring of set.rings) for (const spoke of ring.spokes) pickables.push(spoke.tip);
+    }
+    for (const set of agentRingSets.values()) for (const ring of set.rings) pickables.push(ring.line);
+  }
+
+  /** Selection changed: the selected agent's ring takes the wider material, the previous one drops it. */
+  function refreshRingSelection(): void {
+    for (const set of agentRingSets.values()) {
+      for (const ring of set.rings) ring.line.material = ringMaterial(ring.entry.node.id, ring.executing);
+    }
+  }
+
+  /** Style change: shared materials take the new width/colours; radii, spoke scales and `show` go through the reconcile. */
+  function restyleAgentRings(): void {
+    restyleGlyphMaterials();
     rebuildAgentRings();
   }
 
-  /** Per frame: rings follow their node; executing rings spin about the ring normal, billboarded in 3D. */
-  function updateAgentRings(time: number): void {
+  /**
+   * Lay out `entry`'s label (if visible) at world point `(x, y, z)`, keeping `radius` world units
+   * of silhouette clear on the anchored side. `unitPx` is this frame's px per view unit; under
+   * perspective the silhouette is measured at the point's own depth, so 3D labels hug near and far
+   * glyphs alike.
+   */
+  function layoutLabel(
+    entry: NodeEntry,
+    x: number,
+    y: number,
+    z: number,
+    radius: number,
+    anchor: LabelAnchor,
+    perspective: boolean,
+    unitPx: number,
+  ): void {
+    const label = entry.label;
+    if (!label?.sprite.visible) return;
+    label.sprite.position.set(x, y, z);
+    const pxPerUnit = perspective
+      ? unitPx / Math.max(-labelTmp.set(x, y, z).applyMatrix4(camera.matrixWorldInverse).z, 1e-3)
+      : unitPx;
+    labelLayout.fontPx = entry.sim.lod.fontPx;
+    labelLayout.anchor = anchor;
+    labelLayout.clearancePx = radius * pxPerUnit + labelSettings.offsetPx;
+    label.layout(labelLayout);
+  }
+
+  /**
+   * Per frame: each ring group follows its node and faces the camera in 3D (flat in 2D); executing
+   * ring lines and running tips spin about the ring normal; running tips pulse. Agent labels sit
+   * above the ring's top point, subagent labels at the tip.
+   */
+  function updateAgentRings(time: number, perspective: boolean, unitPx: number): void {
     const spin = ((time / 1000) * agentRingStyle.rotateDegPerSec * THREE.MathUtils.DEG2RAD) % (Math.PI * 2);
     const billboard = mode === "3d-hub";
+    const tipPulse = 1 + TIP_PULSE * (0.5 + 0.5 * Math.sin((time / PULSE_PERIOD_MS) * Math.PI * 2));
     for (const set of agentRingSets.values()) {
-      const { sim, mesh } = set.entry;
+      const { sim } = set.entry;
       const x = sim.x ?? 0;
       const y = sim.y ?? 0;
       const z = sim.z ?? 0;
-      const visible = mesh !== null && mesh.visible;
       for (const ring of set.rings) {
-        const { line } = ring;
-        line.visible = visible;
-        if (!visible) continue;
-        line.position.set(x, y, z);
-        agentRingSpin.setFromAxisAngle(agentRingAxis, ring.executing ? spin : 0);
-        if (billboard) line.quaternion.copy(camera.quaternion).multiply(agentRingSpin);
-        else line.quaternion.copy(agentRingSpin);
+        const { group, line } = ring;
+        group.position.set(x, y, z);
+        if (billboard) group.quaternion.copy(camera.quaternion);
+        else group.quaternion.identity();
+        line.quaternion.setFromAxisAngle(agentRingAxis, ring.executing ? spin : 0);
+        if (ring.entry.label?.sprite.visible) {
+          glyphTmp.set(0, ring.radius, 0).applyQuaternion(group.quaternion).add(group.position);
+          layoutLabel(ring.entry, glyphTmp.x, glyphTmp.y, glyphTmp.z, 0, "above", perspective, unitPx);
+        }
+        for (const spoke of ring.spokes) {
+          const { tip } = spoke;
+          if (spoke.state === "running") {
+            tip.quaternion.setFromAxisAngle(agentRingAxis, spin);
+            tip.scale.setScalar(spoke.tipRadius * tipPulse);
+          }
+          if (spoke.entry.label?.sprite.visible) {
+            glyphTmp.copy(tip.position).applyQuaternion(group.quaternion).add(group.position);
+            layoutLabel(spoke.entry, glyphTmp.x, glyphTmp.y, glyphTmp.z, spoke.tipRadius, spoke.entry.visual.labelAnchor, perspective, unitPx);
+          }
+        }
       }
     }
   }
@@ -1457,8 +1611,6 @@ export function createGraphRenderer(
 
   /** Rebuild what depends on the set of drawn objects without touching the web simulation. */
   function refreshDrawables(): void {
-    meshes = [];
-    for (const e of entries.values()) if (e.mesh) meshes.push(e.mesh);
     for (const e of connectorEntries.values()) classifyConnector(e);
     rebuildAnchorIndex();
     rebuildClusters();
@@ -1657,7 +1809,7 @@ export function createGraphRenderer(
         if (!entry) continue;
         disposeConnectorEntry(entry);
         connectorEntries.delete(change.id);
-        if (entry.simulated) structural = true;
+        if (entry.active) structural = true;
         else drawables = true;
         continue;
       }
@@ -1676,7 +1828,7 @@ export function createGraphRenderer(
       if (!source || !target) continue;
       const entry = createConnectorEntry(connector, source, target);
       connectorEntries.set(connector.id, entry);
-      if (entry.simulated) structural = true;
+      if (entry.active) structural = true;
       else drawables = true;
     }
 
@@ -1697,6 +1849,9 @@ export function createGraphRenderer(
   // ---- picking -------------------------------------------------------------------------------
   const listeners = new Set<(event: GraphEvent) => void>();
   const raycaster = new THREE.Raycaster();
+  // Rings and tips are picked through `LineSegments2.raycast`, which tests the fat line in screen
+  // space (`worldUnits: false`) against `material.resolution` with `linewidth + threshold` px of hit width.
+  raycaster.params.Line2 = { threshold: PICK_LINE_THRESHOLD_PX };
   const pointerNdc = new THREE.Vector2();
   let pointerDown: { x: number; y: number } | null = null;
 
@@ -1704,12 +1859,13 @@ export function createGraphRenderer(
     for (const listener of listeners) listener(event);
   }
 
+  /** Nearest hit among spheres, tip rings and agent rings; the object's `userData.id` is the node (web, subagent or agent) it stands for. */
   function pick(event: PointerEventLike): string | null {
     const rect = canvas.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return null;
     pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
     raycaster.setFromCamera(pointerNdc, camera);
-    const hits = raycaster.intersectObjects(meshes, false);
+    const hits = raycaster.intersectObjects(pickables, false);
     for (const hit of hits) if (hit.object.visible) return hit.object.userData.id as string;
     return null;
   }
@@ -1746,6 +1902,7 @@ export function createGraphRenderer(
     }
     // The selected node's connectors change width, hence batch: regroup rather than just recolour.
     rebuildLineBuffers();
+    refreshRingSelection();
     emit({ type: "select", id });
   }
 
@@ -1840,7 +1997,6 @@ export function createGraphRenderer(
 
   // ---- render loop ---------------------------------------------------------------------------
   renderer.setAnimationLoop((time: number) => {
-    frame++;
     // Seconds since the last frame, capped so a throttled tab does not jump the dash march.
     const dt = Math.min((time - lastFrameTime) / 1000, MARCH_DT_MAX);
     lastFrameTime = time;
@@ -1852,10 +2008,7 @@ export function createGraphRenderer(
       fitPending = false;
       fit();
     }
-    // Spiders ride on the web: place them after the tick, before anything reads positions.
-    spiderMoved = false;
-    for (const entry of entries.values()) if (entry.node.layer === "spider") placeSpider(entry, time);
-    if (clusterStyle.show && (ticked || spiderMoved || hullsDirty)) {
+    if (clusterStyle.show && (ticked || hullsDirty)) {
       updateClusterHulls();
       hullsDirty = false;
     }
@@ -1908,23 +2061,13 @@ export function createGraphRenderer(
         if (mode === "3d-hub") entry.ring.quaternion.copy(camera.quaternion);
         else entry.ring.quaternion.identity();
       }
-      const label = entry.label;
-      if (label?.sprite.visible) {
-        label.sprite.position.set(x, y, z);
-        // Silhouette from the base radius (not the pulse) at this node's own depth, so 3D labels hug near and far nodes alike.
-        const nodePxPerUnit = perspective
-          ? unitPx / Math.max(-labelTmp.set(x, y, z).applyMatrix4(camera.matrixWorldInverse).z, 1e-3)
-          : unitPx;
-        labelLayout.fontPx = sim.lod.fontPx;
-        labelLayout.anchor = visual.labelAnchor;
-        labelLayout.clearancePx = visual.radius * nodePxPerUnit + labelSettings.offsetPx;
-        label.layout(labelLayout);
-      }
+      // Silhouette from the base radius (not the pulse).
+      layoutLabel(entry, x, y, z, visual.radius, visual.labelAnchor, perspective, unitPx);
     }
     updateLinePositions();
     marchDashes(dt);
     updateCones();
-    updateAgentRings(time);
+    updateAgentRings(time, perspective, unitPx);
     renderer.clear();
     renderer.render(hullScene, camera);
     renderer.render(scene, camera);
@@ -2059,8 +2202,8 @@ export function createGraphRenderer(
       ringGeometry.dispose();
       coneGeometry.dispose();
       agentRingGeometry.dispose();
-      agentRingSolidMaterial.dispose();
-      agentRingDashedMaterial.dispose();
+      for (const material of glyphMaterials) material.dispose();
+      pickables.length = 0;
       renderer.dispose();
       canvas.remove();
     },

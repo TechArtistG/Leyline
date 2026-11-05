@@ -11,7 +11,9 @@ Two layers, declared per node kind (`KIND_LAYER` in `shared/model/node.ts`):
 | Layer | Kinds | Laid out by |
 |---|---|---|
 | `web` | `universe`, `host`, `repo`, `branch`, `worktree`, `file`, `pr` | The force simulation. Stable; agents never perturb it. |
-| `spider` | `agent`, `subagent` | Their `anchorId` (agent → worktree, subagent → parent agent): placed on a ring around the anchor, tweened along the web when the anchor changes. |
+| `spider` | `agent`, `subagent` | Their `anchorId` (agent → worktree, subagent → parent agent). Spiders are never drawn as nodes: agentic work renders as **modifiers on the checkout** it rides on (below). |
+
+Spider nodes stay in the `Graph` (they carry the data and are what hover/select report), but the renderer gives them no sphere, label-by-default or tether line, and connectors touching a spider are neither drawn nor simulated. Instead, every checkout wears its agents: one concentric **ring** per anchored agent (dashed and rotating while the agent executes), and on each agent's ring one radial **spoke** per subagent, ending in a small ring **tip** (dashed and rotating while the subagent runs; state-coloured otherwise). Hovering a ring or tip shows the agent's or subagent's label and emits its id; clicking selects it. This is the same 2D glyph language in every mode — in `3d-hub` the glyph plane is billboarded to the camera.
 
 Roots: `universe` is the abstract root everything hangs off; each Paseo daemon is a `host` beneath it. A later view setting will offer `roots: "hosts"` (universe → host → repo) or `roots: "universe"` (hosts collapsed).
 

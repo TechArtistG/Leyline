@@ -55,7 +55,11 @@ export interface LabelSettings {
   referencePxPerUnit: number;
 }
 
-/** Rings around a worktree, one per anchored agent; dashed + rotating while that agent executes. */
+/**
+ * Agentic work as modifiers on a worktree: one ring per anchored agent (dashed + rotating while it
+ * executes), one radial spoke per subagent on that ring with a small ring tip (dashed + rotating
+ * while it runs).
+ */
 export interface AgentRingVisual {
   show: boolean;
   color: ColorRef;
@@ -63,4 +67,10 @@ export interface AgentRingVisual {
   innerScale: number;
   spacing: number;
   rotateDegPerSec: number;
+  /** Spoke length as a multiple of the anchor's radius. */
+  spokeScale: number;
+  /** Tip ring radius as a multiple of the anchor's radius. */
+  spokeTipScale: number;
+  /** 0..1 mix of `color` toward foreground for a running subagent's tip. */
+  spokeLighten: number;
 }

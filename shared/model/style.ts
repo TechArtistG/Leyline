@@ -109,8 +109,9 @@ export const GraphStyle = z.object({
     })
     .optional(),
   /**
-   * Rings drawn around a worktree for each agent anchored to it; concentric when several.
-   * An agent in `executing` state gets a dashed ring that rotates.
+   * Agentic work drawn as modifiers on a worktree: one ring per agent anchored to it (concentric
+   * when several; dashed and rotating while the agent executes) and one radial spoke per subagent
+   * on that agent's ring, ending in a small ring tip (dashed and rotating while the subagent runs).
    */
   agentRings: z
     .object({
@@ -122,8 +123,14 @@ export const GraphStyle = z.object({
       innerScale: z.number().positive().optional(),
       /** World-unit gap between concentric rings. */
       spacing: z.number().positive().optional(),
-      /** Degrees per second for active (dashed) rings. */
+      /** Degrees per second for active (dashed) rings and tips. */
       rotateDegPerSec: z.number().optional(),
+      /** Spoke length as a multiple of the node radius. */
+      spokeScale: z.number().positive().optional(),
+      /** Spoke tip ring radius as a multiple of the node radius. */
+      spokeTipScale: z.number().positive().optional(),
+      /** 0..1 mix of the ring colour toward `foreground` for a running subagent's tip. */
+      spokeLighten: z.number().min(0).max(1).optional(),
     })
     .optional(),
 });
@@ -132,7 +139,17 @@ export type GraphStyle = z.infer<typeof GraphStyle>;
 export const DEFAULT_STYLE: GraphStyle = {
   clusters: { show: true, color: "border", opacity: 0.25, padding: 2 },
   selection: { widthScale: 2, lighten: 0.45 },
-  agentRings: { show: true, color: "warning", width: 2, innerScale: 1.35, spacing: 0.3, rotateDegPerSec: 45 },
+  agentRings: {
+    show: true,
+    color: "warning",
+    width: 2,
+    innerScale: 1.35,
+    spacing: 0.3,
+    rotateDegPerSec: 45,
+    spokeScale: 0.7,
+    spokeTipScale: 0.16,
+    spokeLighten: 0.35,
+  },
   nodes: {
     universe: { color: "border", emissive: 0.2, labelAlways: true, labelTier: "project" },
     host: { color: "muted", labelAlways: true, labelTier: "project" },
@@ -291,6 +308,9 @@ export class StyleResolver {
       innerScale: r.innerScale ?? 1.35,
       spacing: r.spacing ?? 0.3,
       rotateDegPerSec: r.rotateDegPerSec ?? 45,
+      spokeScale: r.spokeScale ?? 0.7,
+      spokeTipScale: r.spokeTipScale ?? 0.16,
+      spokeLighten: r.spokeLighten ?? 0.35,
     };
   }
 }
