@@ -455,8 +455,43 @@ export function createGraphRenderer(
 
   const sphereGeometry = new THREE.SphereGeometry(1, 24, 16);
   const dodecahedronGeometry = new THREE.DodecahedronGeometry(1, 0);
+  const dodecahedronClusterGeometry = buildDodecahedronCluster();
   const geometryFor = (shape: NodeVisual["shape"]): Three.BufferGeometry =>
-    shape === "dodecahedron" ? dodecahedronGeometry : sphereGeometry;
+    shape === "dodecahedron" ? dodecahedronGeometry : shape === "dodecahedron-cluster" ? dodecahedronClusterGeometry : sphereGeometry;
+
+  /**
+   * A central dodecahedron with one mated on each of its 12 faces. Faces come in parallel pairs, so
+   * an untransformed copy translated by twice the inradius along a face normal sits flush. Scaled so
+   * the whole cluster fits a unit radius (slightly over, so it reads bulkier than a unit sphere).
+   */
+  function buildDodecahedronCluster(): Three.BufferGeometry {
+    const unit = dodecahedronGeometry.getAttribute("position").array as Float32Array;
+    const normals = dodecahedronGeometry.getAttribute("normal").array as Float32Array;
+    const phi = (1 + Math.sqrt(5)) / 2;
+    // Face normals of three's dodecahedron = icosahedron vertex directions.
+    const dirs: number[][] = [];
+    for (const a of [-1, 1]) for (const b of [-phi, phi]) dirs.push([0, a, b], [a, b, 0], [b, 0, a]);
+    const inradius = 0.7947; // for circumradius 1
+    const copies = [[0, 0, 0], ...dirs.map((d) => d.map((v) => (v / Math.hypot(d[0], d[1], d[2])) * inradius * 2))];
+    const extent = 1 + inradius * 2 + 1;
+    const scale = 1.2 / extent;
+    const positions = new Float32Array(unit.length * copies.length);
+    const outNormals = new Float32Array(normals.length * copies.length);
+    copies.forEach(([ox, oy, oz], c) => {
+      const base = c * unit.length;
+      for (let i = 0; i < unit.length; i += 3) {
+        positions[base + i] = (unit[i] + ox) * scale;
+        positions[base + i + 1] = (unit[i + 1] + oy) * scale;
+        positions[base + i + 2] = (unit[i + 2] + oz) * scale;
+      }
+      outNormals.set(normals, base);
+    });
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("normal", new THREE.BufferAttribute(outNormals, 3));
+    geometry.computeBoundingSphere();
+    return geometry;
+  }
   /** Stable hue per label (FNV-1a), tuned for a dark surface. */
   const labelHashColor = (label: string, out: Three.Color): Three.Color => {
     let h = 0x811c9dc5;
@@ -2463,6 +2498,7 @@ export function createGraphRenderer(
       connectorEntries.clear();
       sphereGeometry.dispose();
       dodecahedronGeometry.dispose();
+      dodecahedronClusterGeometry.dispose();
       ringGeometry.dispose();
       coneGeometry.dispose();
       agentRingGeometry.dispose();
