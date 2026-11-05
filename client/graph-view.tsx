@@ -1,9 +1,11 @@
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin/client";
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Platform, Text, View } from "react-native";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Platform, Pressable, Text, View } from "react-native";
 import { rendererReportRpc } from "../shared/contracts";
-import { type SceneHandle, mountScene } from "./web";
+import { GRAPH_MODES, GRAPH_MODE_LABELS, type GraphHandle, type GraphMode } from "../shared/graph";
+import { mockTopology } from "./mock/topology";
+import { mountGraph } from "./web";
 
 interface GraphViewProps {
   theme: PluginTheme;
@@ -11,20 +13,58 @@ interface GraphViewProps {
   caption: string;
 }
 
-/** Hosts the WebGL canvas. On native there is no renderer, so it shows a notice instead. */
+const MODES: ReadonlyArray<{ mode: GraphMode; label: string }> = GRAPH_MODES.map((mode) => ({
+  mode,
+  label: GRAPH_MODE_LABELS[mode],
+}));
+
+/** Hosts the WebGL graph. On native there is no renderer, so it shows a notice instead. */
 export function GraphView({ theme, surface, caption }: GraphViewProps) {
   const parent = useRef<View>(null);
-  const scene = useRef<SceneHandle | null>(null);
+  const graph = useRef<GraphHandle | null>(null);
   const report = useRpc(rendererReportRpc);
-  const [status, setStatus] = useState<string>(Platform.OS === "web" ? "mounting…" : "WebGL renderer is web-only");
+  const [mode, setModeState] = useState<GraphMode>("3d-hub");
+  // The renderer mounts once per theme/surface; mode changes go through `setMode` without a remount,
+  // so the mount effect reads the current mode from a ref rather than depending on it.
+  const modeRef = useRef<GraphMode>(mode);
+  const [info, setInfo] = useState<string>(Platform.OS === "web" ? "mounting…" : "WebGL renderer is web-only");
+  const [selected, setSelected] = useState<string | null>(null);
 
   const styles = useMemo(
     () => ({
       root: { flex: 1, backgroundColor: theme.colors.surface0 },
       canvas: { flex: 1 },
-      bar: { paddingHorizontal: 12, paddingVertical: 6, borderTopWidth: 1, borderTopColor: theme.colors.border },
+      bar: {
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: 8,
+        paddingHorizontal: 8,
+        paddingVertical: 4,
+        borderTopWidth: 1,
+        borderTopColor: theme.colors.border,
+        backgroundColor: theme.colors.surface1,
+      },
+      segment: {
+        flexDirection: "row" as const,
+        borderWidth: 1,
+        borderColor: theme.colors.border,
+        borderRadius: 4,
+        overflow: "hidden" as const,
+      },
+      button: { paddingHorizontal: 8, paddingVertical: 3, backgroundColor: theme.colors.surface2 },
+      buttonActive: { backgroundColor: theme.colors.accent },
+      buttonText: { color: theme.colors.foreground, fontSize: 11 },
+      buttonTextActive: { color: theme.colors.accentForeground, fontSize: 11 },
+      action: {
+        paddingHorizontal: 8,
+        paddingVertical: 3,
+        borderWidth: 1,
+        borderColor: theme.colors.border,
+        borderRadius: 4,
+        backgroundColor: theme.colors.surface2,
+      },
       caption: { color: theme.colors.foreground, fontSize: 12 },
-      status: { color: theme.colors.foregroundMuted, fontSize: 11 },
+      status: { flex: 1, textAlign: "right" as const, color: theme.colors.foregroundMuted, fontSize: 11 },
     }),
     [theme],
   );
@@ -32,37 +72,81 @@ export function GraphView({ theme, surface, caption }: GraphViewProps) {
   useLayoutEffect(() => {
     if (Platform.OS !== "web") return;
     let cancelled = false;
+    let unsubscribe: (() => void) | undefined;
     void (async () => {
       let detail: string;
       let ok = false;
       try {
-        const handle = await mountScene(parent.current, theme);
+        const handle = await mountGraph(parent.current, theme, modeRef.current);
         if (cancelled) {
           handle?.destroy();
           return;
         }
-        scene.current = handle;
+        graph.current = handle;
         ok = handle !== null;
-        detail = handle?.info ?? "mountScene returned null";
+        detail = handle?.info ?? "mountGraph returned null";
+        if (handle) {
+          unsubscribe = handle.on((event) => {
+            if (event.type === "select") setSelected(event.id);
+          });
+          handle.apply(mockTopology());
+        }
       } catch (cause) {
         detail = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
       }
-      setStatus(detail);
+      setInfo(detail);
       void report({ surface, ok, detail }).catch(() => undefined);
     })();
     return () => {
       cancelled = true;
-      scene.current?.destroy();
-      scene.current = null;
+      unsubscribe?.();
+      graph.current?.destroy();
+      graph.current = null;
+      setSelected(null);
     };
   }, [report, surface, theme]);
+
+  const setMode = useCallback((next: GraphMode) => {
+    modeRef.current = next;
+    setModeState(next);
+    graph.current?.setMode(next);
+  }, []);
+  const relayout = useCallback(() => graph.current?.relayout(), []);
+  const fit = useCallback(() => graph.current?.fit(), []);
+
+  const status = selected ? `${selected} · ${info}` : info;
 
   return (
     <View style={styles.root}>
       <View ref={parent} style={styles.canvas} />
       <View style={styles.bar}>
         <Text style={styles.caption}>{caption}</Text>
-        <Text style={styles.status}>{status}</Text>
+        <View style={styles.segment} accessibilityRole="radiogroup" accessibilityLabel="Layout mode">
+          {MODES.map(({ mode: m, label }) => {
+            const active = m === mode;
+            return (
+              <Pressable
+                key={m}
+                accessibilityRole="button"
+                accessibilityLabel={`${label} layout`}
+                accessibilityState={{ selected: active }}
+                onPress={() => setMode(m)}
+                style={active ? [styles.button, styles.buttonActive] : styles.button}
+              >
+                <Text style={active ? styles.buttonTextActive : styles.buttonText}>{label}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+        <Pressable accessibilityRole="button" accessibilityLabel="Re-layout graph" onPress={relayout} style={styles.action}>
+          <Text style={styles.buttonText}>Re-layout</Text>
+        </Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel="Fit graph to view" onPress={fit} style={styles.action}>
+          <Text style={styles.buttonText}>Fit</Text>
+        </Pressable>
+        <Text style={styles.status} numberOfLines={1}>
+          {status}
+        </Text>
       </View>
     </View>
   );

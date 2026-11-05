@@ -47,7 +47,7 @@ Leyline **observes and brokers**; it does not launch agents itself. Agents stay 
 | Host | Paseo plugin API (`@getpaseo/plugin`) | Experimental API; panels need Paseo ≥ 0.13, hooks ≥ 0.14. Developed against 0.15.2. |
 | Agent engine | Provider-agnostic via Paseo; OMP (oh-my-pi) is the primary target | Paseo ships a native OMP provider (`omp --mode rpc-ui`, JSONL over stdio). Developed against omp 18.16.0; Paseo requires ≥ 16.3.9. |
 | Renderer | **three.js** (imperative, `import("three")` behind the web gate) — [ADR-001](docs/ADR-001-renderer.md) | Spike verified: three r187 renders WebGL 2.0 inside a Paseo 0.15.2 panel on Electron |
-| Physics | `d3-force-3d` (1D/2D/3D from one simulation) | Common to all three candidates |
+| Layout | `d3-force-3d`, seeded and ticked at a fixed count → deterministic | Three modes: `2d-lr` layered left→right (tree depth fixes x), `2d-hub`, `3d-hub` |
 | Styling | Paseo `PluginTheme` tokens + injected CSS | Dark-mode first, neon/cyan to match the Leyline logo |
 | Language | TypeScript, React (React Native Web on desktop) | Node 22 / npm |
 
@@ -194,7 +194,7 @@ interface GraphRenderer {
 - [x] `paseo plugin init`; sidebar header item + hub screen + workspace panel registered
 - [x] **Bundling spike**: three.js scene mounted in a Paseo workspace panel; WebGL 2.0, resize, `three/addons` subpath export verified. `require("three")` fails (`process.emitWarning`), dynamic `import()` works
 - [x] Decide renderer: three.js DIY — [ADR-001](docs/ADR-001-renderer.md)
-- [ ] Mock topology fixtures (hosts, repos, worktrees, agents, subagents) rendered in 2D and 3D
+- [x] Mock topology fixtures (40 nodes / 45 links) rendered in three layout modes with Re-layout / Fit, hover and select
 - [x] Leyline logo (directed "L"): `assets/icon.png` in the manifest, monochrome SVG (`client/logo.ts`) as the sidebar item and panel icon
 
 ### Phase 2: Live topology
@@ -204,8 +204,10 @@ interface GraphRenderer {
 - [ ] Click-through: `navigation.openAgent` / `openWorkspace`
 
 ### Phase 3: Interconnection & integration branch
-- [ ] `defineAgentTool`: `leyline_request_context`, `leyline_merge_into_integration`
-- [ ] Integration worktree as a merge-target node; `merges-into` edges; server-side `git merge` with result reporting
+See [docs/DESIGN.md](docs/DESIGN.md) for the integration-branch model (rebuildable proxy for `main`).
+- [ ] `.leyline/integrations.json` manifest; `merges-into` edges with `included` / `stale` / `conflicts` state from `git merge-base` + `git merge-tree`
+- [ ] Rebuild action (reset to base, merge sources in order, `rerere` for recorded resolutions); `on-change` rebuild via `agent.turn.after`
+- [ ] `defineAgentTool`: `leyline_request_context`, `leyline_merge_into_integration` (declared sources only)
 - [ ] `shares-context` edges derived from broker calls; node quick-views for `AGENTS.md` / `DESIGN.md` and diffs
 - [ ] Drag-and-drop: task/branch node onto agent node → `workspace.agents.create({ prompt, parent })`
 
