@@ -125,7 +125,7 @@ interface ConnectorEntry {
   drawn: boolean;
   visual: ConnectorVisual;
   revision: number;
-  /** Arrowhead at the target when `visual.directed` and drawn. */
+  /** Arrowhead at the target when `visual.directed`, single-lane and drawn. */
   cone: Three.Mesh<Three.ConeGeometry, Three.MeshBasicMaterial> | null;
 }
 /**
@@ -154,8 +154,10 @@ interface ClusterDrawable {
   positions: Float32Array;
 }
 /**
- * One fat-line draw: every drawn connector sharing a `(width px, dashed)` key. Width is a material
- * uniform, hence a batch key; the selected node's connectors (scaled width) land in their own batch.
+ * One fat-line draw: every drawn connector lane sharing a `(width px, dashed, lane, velocity)` key.
+ * Width, dash flag and dash offset are material uniforms, hence batch keys; the selected node's
+ * connectors (scaled width) land in their own batch. A 2-lane connector contributes one segment to
+ * a `lane = +1` batch and one to a `lane = -1` batch, offset to either side of the centre line.
  * Buffers are instanced-interleaved views over the arrays here, updated in place each frame.
  */
 interface LineBatch {
@@ -163,6 +165,10 @@ interface LineBatch {
   material: LineMaterialModule.LineMaterial;
   object: LineSegments2Module.LineSegments2;
   entries: ConnectorEntry[];
+  /** `0`: centred single line; `±1`: side of a 2-lane connector, offset `±LANE_GAP` and trimmed to the sphere surfaces. */
+  lane: -1 | 0 | 1;
+  /** Dash march speed, world units/s along source→target (negative: toward the source); 0 = static. */
+  velocity: number;
   positions: Float32Array;
   colors: Float32Array;
   positionBuffer: Three.InterleavedBuffer;
@@ -170,6 +176,14 @@ interface LineBatch {
   /** Dashed only: per-segment `(0, length)` pairs so each connector's dash pattern starts at its source. */
   distances: Float32Array | null;
   distanceBuffer: Three.InterleavedBuffer | null;
+}
+/** Drawn connectors grouped under one batch key, with the key's components for batch creation. */
+interface LineGroup {
+  width: number;
+  dashed: boolean;
+  lane: -1 | 0 | 1;
+  velocity: number;
+  entries: ConnectorEntry[];
 }
 /** One concentric ring around a worktree for one anchored agent; dashed + spinning while that agent executes. */
 interface AgentRing {
@@ -244,6 +258,11 @@ const CONE_RADIUS = 0.28;
 /** Connector dash pattern, world units along the segment (fat-line dash distances are pre-projection). */
 const DASH_SIZE = 0.6;
 const GAP_SIZE = 0.4;
+const DASH_PERIOD = DASH_SIZE + GAP_SIZE;
+/** Half-separation of a 2-lane connector's lines from the centre line, world units × max(1, mean endpoint radius). */
+const LANE_GAP = 0.12;
+/** Cap on the frame delta fed to the dash march, so a throttled/hidden tab resumes without a jump. */
+const MARCH_DT_MAX = 0.1;
 /** Agent rings: polyline resolution, dash count per executing ring (dash and gap each 1/24 of the circumference). */
 const AGENT_RING_SEGMENTS = 64;
 const AGENT_RING_DASHES = 12;
@@ -291,6 +310,8 @@ export function createGraphRenderer(
   let resolver = new StyleResolver(initialStyle);
   const surface = new THREE.Color(theme.colors.surface0);
   const foreground = new THREE.Color(theme.colors.foreground);
+  /** Scratch for `NodeVisual.lighten`: the role colour mixed toward `foreground`. */
+  const tintColor = new THREE.Color();
   /** Resolved `ColorRef` → colour; cleared when the style (and thus its palette) changes. */
   let colorCache = new Map<ColorRef, Three.Color>();
   let selectionStyle = resolver.selectionVisual();
@@ -377,8 +398,9 @@ export function createGraphRenderer(
   }
 
   // Opacity per connector is pre-mixed into the vertex colours against the surface colour, so one
-  // draw call per batch carries every opacity. Width is a material uniform of the fat-line shader,
-  // so connectors are batched by `(width, dashed)`; the few distinct style widths keep this small.
+  // draw call per batch carries every opacity. Width, dash flag and dash offset (march) are material
+  // uniforms of the fat-line shader, so connectors are batched by `(width, dashed, lane, velocity)`;
+  // the few distinct style widths/speeds keep this small.
   const lineBatches = new Map<string, LineBatch>();
   /** `lineBatches` values as an array for the frame loop. */
   let lineBatchList: LineBatch[] = [];
@@ -416,13 +438,21 @@ export function createGraphRenderer(
     return { positions, colors, positionBuffer, colorBuffer, distances, distanceBuffer };
   }
 
-  function createLineBatch(linewidth: number, dashed: boolean, count: number): LineBatch {
+  function createLineBatch(group: LineGroup): LineBatch {
     const geometry = new LineSegmentsGeometry();
-    const material = createLineMaterial(linewidth, dashed);
+    const material = createLineMaterial(group.width, group.dashed);
     const object = new LineSegments2(geometry, material);
     object.frustumCulled = false;
     scene.add(object);
-    return { geometry, material, object, entries: [], ...fillLineGeometry(geometry, dashed, count) };
+    return {
+      geometry,
+      material,
+      object,
+      entries: group.entries,
+      lane: group.lane,
+      velocity: group.velocity,
+      ...fillLineGeometry(geometry, group.dashed, group.entries.length),
+    };
   }
 
   /** Resize a batch to `count` segments: a fresh geometry releases the old GPU buffers with it. */
@@ -936,9 +966,10 @@ export function createGraphRenderer(
   function refreshMaterial(entry: NodeEntry): void {
     const { node, mesh, visual } = entry;
     if (!mesh) return;
-    const color = colorFor(visual.color);
-    mesh.material.color.copy(color);
-    mesh.material.emissive.copy(color);
+    // `lighten` tints the role colour toward the foreground; base and emissive share the tint.
+    tintColor.copy(colorFor(visual.color)).lerp(foreground, visual.lighten);
+    mesh.material.color.copy(tintColor);
+    mesh.material.emissive.copy(tintColor);
     let intensity = visual.emissive;
     if (node.id === selectedId) intensity += SELECT_EMISSIVE;
     if (node.id === hoveredId) intensity += HOVER_EMISSIVE;
@@ -1071,10 +1102,13 @@ export function createGraphRenderer(
   const tmpColor = new THREE.Color();
   const tmpMix = new THREE.Color();
   const tmpDir = new THREE.Vector3();
+  /** Scratch: camera view direction, refreshed once per `updateLinePositions`. */
+  const cameraForward = new THREE.Vector3();
   const coneUp = new THREE.Vector3(0, 1, 0);
 
   function refreshCone(entry: ConnectorEntry): void {
-    if (!entry.visual.directed || !entry.drawn) {
+    // Two-lane connectors are undirected by construction: a cone would sit between the lanes.
+    if (!entry.visual.directed || entry.visual.lanes === 2 || !entry.drawn) {
       if (entry.cone) {
         scene.remove(entry.cone);
         entry.cone.material.dispose();
@@ -1091,13 +1125,18 @@ export function createGraphRenderer(
     entry.cone.material.color.copy(tmpMix);
   }
 
-  /** Returns true when the connector changed batch key (width or dashed), which needs a buffer rebuild. */
+  /** Returns true when the connector changed batch key (width, dashed, lanes or march), which needs a buffer rebuild. */
   function restyleConnector(entry: ConnectorEntry): boolean {
     const previous = entry.visual;
     entry.visual = resolver.connectorVisual(entry.connector);
     entry.revision = entry.connector.revision;
     refreshCone(entry);
-    return previous.dashed !== entry.visual.dashed || previous.width !== entry.visual.width;
+    return (
+      previous.dashed !== entry.visual.dashed ||
+      previous.width !== entry.visual.width ||
+      previous.lanes !== entry.visual.lanes ||
+      previous.marchSpeed !== entry.visual.marchSpeed
+    );
   }
 
   /** Incident to the selected node: drawn wider and lighter, in its own batch. */
@@ -1141,30 +1180,54 @@ export function createGraphRenderer(
     }
   }
 
+  function groupConnector(
+    grouped: Map<string, LineGroup>,
+    entry: ConnectorEntry,
+    width: number,
+    lane: -1 | 0 | 1,
+    velocity: number,
+  ): void {
+    const { dashed } = entry.visual;
+    const key = `${width}|${dashed ? "d" : "s"}|${lane}|${velocity}`;
+    let group = grouped.get(key);
+    if (!group) grouped.set(key, (group = { width, dashed, lane, velocity, entries: [] }));
+    group.entries.push(entry);
+  }
+
   /**
-   * Regroup every drawn connector into its `(width, dashed)` batch and resize the batch buffers.
+   * Regroup every drawn connector into its `(width, dashed, lane, velocity)` batch(es) and resize
+   * the batch buffers. A 2-lane connector lands in two batches: lane `+1` marching source→target
+   * and lane `−1` marching back; a single lane marches forward (`marchSpeed > 0`) or is static.
    * Runs on structural/drawable changes, style changes and selection changes (the selected node's
    * connectors change width, hence batch); batches left without members are disposed.
    */
   function rebuildLineBuffers(): void {
-    const grouped = new Map<string, ConnectorEntry[]>();
+    const grouped = new Map<string, LineGroup>();
     for (const e of connectorEntries.values()) {
       if (!e.drawn) continue;
-      const key = `${connectorWidth(e)}|${e.visual.dashed ? "d" : "s"}`;
-      let list = grouped.get(key);
-      if (!list) grouped.set(key, (list = []));
-      list.push(e);
+      const width = connectorWidth(e);
+      // Only dashed lines can march: a solid line's dash offset is never read.
+      const speed = e.visual.dashed ? e.visual.marchSpeed : 0;
+      if (e.visual.lanes === 2) {
+        groupConnector(grouped, e, width, 1, speed);
+        groupConnector(grouped, e, width, -1, -speed);
+      } else {
+        groupConnector(grouped, e, width, 0, speed);
+      }
     }
     for (const [key, batch] of lineBatches) {
       if (grouped.has(key)) continue;
       disposeLineBatch(batch);
       lineBatches.delete(key);
     }
-    for (const [key, list] of grouped) {
-      let batch = lineBatches.get(key);
-      if (batch) resizeLineBatch(batch, list.length);
-      else lineBatches.set(key, (batch = createLineBatch(connectorWidth(list[0]), list[0].visual.dashed, list.length)));
-      batch.entries = list;
+    for (const [key, group] of grouped) {
+      const batch = lineBatches.get(key);
+      if (batch) {
+        batch.entries = group.entries;
+        resizeLineBatch(batch, group.entries.length);
+      } else {
+        lineBatches.set(key, createLineBatch(group));
+      }
     }
     lineBatchList = [...lineBatches.values()];
     refreshLineColors();
@@ -1191,19 +1254,61 @@ export function createGraphRenderer(
     }
   }
 
-  /** Write endpoint positions (and, for dashed batches, segment lengths) into the instanced buffers in place. */
+  /**
+   * Write endpoint positions (and, for dashed batches, segment lengths) into the instanced buffers
+   * in place. Lane batches (`lane ≠ 0`) shift the segment sideways by `±LANE_GAP × max(1, mean
+   * endpoint radius)` along `normalize(dir × cameraForward)` — perpendicular to the segment and to
+   * the view, so the two lanes stay side by side on screen (world Y when the segment points at the
+   * camera) — and trim both ends to the sphere surfaces so the lanes run edge to edge.
+   */
   function updateLinePositions(): void {
+    camera.getWorldDirection(cameraForward);
+    const fx = cameraForward.x;
+    const fy = cameraForward.y;
+    const fz = cameraForward.z;
     for (const batch of lineBatchList) {
-      const { entries: list, positions, distances } = batch;
+      const { entries: list, positions, distances, lane } = batch;
       for (let i = 0; i < list.length; i++) {
         const { source, target } = list[i].link;
         const o = i * 6;
-        const sx = source.x ?? 0;
-        const sy = source.y ?? 0;
-        const sz = source.z ?? 0;
-        const tx = target.x ?? 0;
-        const ty = target.y ?? 0;
-        const tz = target.z ?? 0;
+        let sx = source.x ?? 0;
+        let sy = source.y ?? 0;
+        let sz = source.z ?? 0;
+        let tx = target.x ?? 0;
+        let ty = target.y ?? 0;
+        let tz = target.z ?? 0;
+        const dx = tx - sx;
+        const dy = ty - sy;
+        const dz = tz - sz;
+        let length = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (lane !== 0 && length > 1e-6) {
+          const ux = dx / length;
+          const uy = dy / length;
+          const uz = dz / length;
+          let nx = uy * fz - uz * fy;
+          let ny = uz * fx - ux * fz;
+          let nz = ux * fy - uy * fx;
+          const n = Math.sqrt(nx * nx + ny * ny + nz * nz);
+          if (n > 1e-6) {
+            nx /= n;
+            ny /= n;
+            nz /= n;
+          } else {
+            nx = 0;
+            ny = 1;
+            nz = 0;
+          }
+          const gap = lane * LANE_GAP * Math.max(1, (source.radius + target.radius) / 2);
+          const sr = source.radius;
+          const tr = target.radius;
+          sx += ux * sr + nx * gap;
+          sy += uy * sr + ny * gap;
+          sz += uz * sr + nz * gap;
+          tx += nx * gap - ux * tr;
+          ty += ny * gap - uy * tr;
+          tz += nz * gap - uz * tr;
+          length = Math.max(0, length - sr - tr);
+        }
         positions[o] = sx;
         positions[o + 1] = sy;
         positions[o + 2] = sz;
@@ -1211,15 +1316,24 @@ export function createGraphRenderer(
         positions[o + 4] = ty;
         positions[o + 5] = tz;
         if (distances) {
-          const dx = tx - sx;
-          const dy = ty - sy;
-          const dz = tz - sz;
           distances[i * 2] = 0;
-          distances[i * 2 + 1] = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          distances[i * 2 + 1] = length;
         }
       }
       batch.positionBuffer.needsUpdate = true;
       if (batch.distanceBuffer) batch.distanceBuffer.needsUpdate = true;
+    }
+  }
+
+  /**
+   * Advance each marching batch's dash pattern by `velocity × dt`. The shader samples
+   * `distance + dashOffset`, so a growing offset moves dashes toward the source; subtract to march
+   * along `velocity`'s sign. Wrapped to one dash period so the uniform never drifts.
+   */
+  function marchDashes(dt: number): void {
+    for (const batch of lineBatchList) {
+      if (batch.velocity === 0) continue;
+      batch.material.dashOffset = (batch.material.dashOffset - batch.velocity * dt) % DASH_PERIOD;
     }
   }
 
@@ -1727,6 +1841,8 @@ export function createGraphRenderer(
   // ---- render loop ---------------------------------------------------------------------------
   renderer.setAnimationLoop((time: number) => {
     frame++;
+    // Seconds since the last frame, capped so a throttled tab does not jump the dash march.
+    const dt = Math.min((time - lastFrameTime) / 1000, MARCH_DT_MAX);
     lastFrameTime = time;
     let ticked = false;
     if (simulation.alpha() >= ALPHA_MIN) {
@@ -1806,6 +1922,7 @@ export function createGraphRenderer(
       }
     }
     updateLinePositions();
+    marchDashes(dt);
     updateCones();
     updateAgentRings(time);
     renderer.clear();
@@ -1858,7 +1975,7 @@ export function createGraphRenderer(
       } else if (drawablesChanged) {
         refreshDrawables();
       } else {
-        // Widths, dash flags and the selection width scale are all batch keys: regroup unconditionally.
+        // Widths, dash flags, lanes, march speeds and the selection width scale are all batch keys: regroup unconditionally.
         rebuildLineBuffers();
       }
       restyleAgentRings();

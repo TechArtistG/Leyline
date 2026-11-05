@@ -20,6 +20,8 @@ export interface NodeVisual {
   labelTier: "project" | "all";
   /** Not drawn and not simulated; incident connectors are hidden too. */
   hidden: boolean;
+  /** 0..1 mix of `color` toward foreground. */
+  lighten: number;
 }
 
 export interface ConnectorVisual {
@@ -31,6 +33,10 @@ export interface ConnectorVisual {
   dashed: boolean;
   /** Draw an arrowhead at the target. */
   directed: boolean;
+  /** 1 or 2 parallel lines; two lanes march in opposite directions. */
+  lanes: 1 | 2;
+  /** Dash march speed in world units/s; 0 = static. */
+  marchSpeed: number;
 }
 
 /** Resolved global label behaviour (screen-space sizing, anchoring, zoom LOD). */

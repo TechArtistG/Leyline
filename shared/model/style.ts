@@ -29,6 +29,8 @@ const NodeStyle = z.object({
   emissive: z.number().min(0).max(1).optional(),
   pulse: z.boolean().optional(),
   ring: ColorRefSchema.nullable().optional(),
+  /** 0..1 mix of `color` toward `foreground` (a lighter tint of the same role). */
+  lighten: z.number().min(0).max(1).optional(),
   labelAlways: z.boolean().optional(),
   /** Screen-space side of the node the label sits on. Overrides `labels.anchor`. */
   labelAnchor: z.enum(LABEL_ANCHORS).optional(),
@@ -50,6 +52,10 @@ const ConnectorStyle = z.object({
   width: z.number().positive().optional(),
   dashed: z.boolean().optional(),
   directed: z.boolean().optional(),
+  /** Parallel lines drawn for one connector (1 or 2). Two lanes march in opposite directions. */
+  lanes: z.union([z.literal(1), z.literal(2)]).optional(),
+  /** Dash march speed in world units per second; 0 = static. Requires `dashed`. */
+  marchSpeed: z.number().min(0).optional(),
 });
 export type ConnectorStyle = z.infer<typeof ConnectorStyle>;
 
@@ -156,13 +162,14 @@ export const DEFAULT_STYLE: GraphStyle = {
       },
     },
     subagent: {
-      color: "accent",
+      color: "warning",
+      lighten: 0.35,
       emissive: 0.3,
       states: {
         running: { pulse: true, emissive: 0.6 },
-        completed: { color: "muted", emissive: 0 },
-        failed: { color: "danger" },
-        canceled: { color: "border", emissive: 0 },
+        completed: { color: "muted", lighten: 0, emissive: 0 },
+        failed: { color: "danger", lighten: 0 },
+        canceled: { color: "border", lighten: 0, emissive: 0 },
       },
     },
     file: { color: "foreground", hidden: true },
@@ -185,7 +192,7 @@ export const DEFAULT_STYLE: GraphStyle = {
       directed: true,
       states: { inferred: { dashed: true, opacity: 0.6 } },
     },
-    spawned: { color: "accent", opacity: 0.9, width: 1.5, directed: true },
+    spawned: { color: "warning", opacity: 0.9, width: 1.25, dashed: true, lanes: 2, marchSpeed: 2 },
     touches: { color: "muted", opacity: 0.7, width: 1.25, states: { write: { color: "warning" }, edit: { color: "warning" } } },
     "merges-into": {
       color: "success",
@@ -229,6 +236,7 @@ export class StyleResolver {
       labelAnchor: merged.labelAnchor ?? this.labels().anchor,
       labelTier: merged.labelTier ?? "all",
       hidden: merged.hidden ?? false,
+      lighten: merged.lighten ?? 0,
     };
   }
 
@@ -244,6 +252,8 @@ export class StyleResolver {
       width: merged.width ?? 1.5,
       dashed: merged.dashed ?? false,
       directed: merged.directed ?? false,
+      lanes: merged.lanes ?? 1,
+      marchSpeed: merged.marchSpeed ?? 0,
     };
   }
 
