@@ -1,0 +1,44 @@
+import type {
+  PluginClientContext,
+  PluginScreenProps,
+  PluginSidebarItemProps,
+  PluginWorkspacePanelProps,
+} from "@getpaseo/plugin/client";
+import { SidebarRow } from "@getpaseo/plugin/client/ui";
+import { GraphView } from "./client/graph-view";
+
+const HUB = "hub";
+const PANEL = "graph";
+
+function HubScreen({ theme, host }: PluginScreenProps) {
+  return <GraphView theme={theme} surface="hub" caption={`Leyline hub · host ${host.label}`} />;
+}
+
+function WorkspacePanel({ theme, workspaceId }: PluginWorkspacePanelProps) {
+  return <GraphView theme={theme} surface="workspace" caption={`Leyline · workspace ${workspaceId}`} />;
+}
+
+function HubItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
+  return (
+    <SidebarRow
+      icon="Waypoints"
+      active={currentScreen?.screenId === HUB}
+      onPress={() => openScreen({ screenId: HUB })}
+    />
+  );
+}
+
+export default function contribute(client: PluginClientContext) {
+  const removers = [
+    client.addScreen({ id: HUB, title: "Leyline", Component: HubScreen }),
+    client.addSidebarHeaderItem({ id: HUB, title: "Leyline", Component: HubItem }),
+    client.addWorkspacePanel({
+      id: PANEL,
+      title: "Leyline",
+      icon: "Waypoints",
+      locations: ["workspace", "explorer"],
+      Component: WorkspacePanel,
+    }),
+  ];
+  return () => removers.forEach((remove) => remove());
+}
