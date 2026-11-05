@@ -4,9 +4,28 @@ Living document. Architecture decisions with alternatives go in `docs/ADR-*.md`;
 
 ## Graph model
 
-`shared/graph.ts` is the single contract between the daemon-side topology builder and the client renderer: `GNode` / `GLink` / `GraphPatch`, three layout modes (`2d-lr`, `2d-hub`, `3d-hub`), and the `GraphHandle` the renderer exposes to React. The daemon streams patches; the renderer keeps node identity stable so layouts persist across updates.
+**Git is the spiderweb; agents are the spiders that crawl along it.**
 
-Node kinds: `host → repo → worktree → agent → subagent`, plus `branch`, `file`, `pr`. Tree links (`contains`, `spawned`, `branch-of`, `touches`) define depth for the layered layout; `merges-into` and `shares-context` are cross-links.
+Two layers, declared per node kind (`KIND_LAYER` in `shared/model/node.ts`):
+
+| Layer | Kinds | Laid out by |
+|---|---|---|
+| `web` | `universe`, `host`, `repo`, `branch`, `worktree`, `file`, `pr` | The force simulation. Stable; agents never perturb it. |
+| `spider` | `agent`, `subagent` | Their `anchorId` (agent → worktree, subagent → parent agent): placed on a ring around the anchor, tweened along the web when the anchor changes. |
+
+Roots: `universe` is the abstract root everything hangs off; each Paseo daemon is a `host` beneath it. The topology builder will offer `roots: "hosts"` (universe → host → repo) or `roots: "universe"` (hosts collapsed) as a view setting.
+
+### Wire vs model
+
+- **Wire** (`shared/model/wire.ts`): Zod discriminated unions per kind — `NodeData`, `ConnectorData`, `GraphPatch { upsertNodes, removeNodes, upsertConnectors, removeConnectors }`. This is what the daemon streams; it never carries class instances.
+- **Model** (`shared/model/`): `GraphNode<K>` and `Connector<K>` base classes with one subclass per kind (`nodes.ts`, `connectors.ts`, `factory.ts`). Instances are the in-memory truth on both sides, hydrated by `Graph.applyPatch`, mutated only through `update(data)` which bumps `revision` when something observable changed. `Graph` holds adjacency, cascades node removal to incident connectors, drops connectors with missing endpoints, and emits one batched `GraphChange[]` per patch to subscribers.
+- **Renderer contract** (`shared/graph.ts`): `GraphHandle { graph, setMode, setStyle, relayout, fit, on, destroy }` and the three layout modes (`2d-lr`, `2d-hub`, `3d-hub`). The renderer subscribes to the `Graph`; it owns no node data.
+
+Tree connectors (`TREE_CONNECTOR_KINDS`: `contains`, `spawned`, `branch-of`, `touches`, `merges-into`) define depth for the layered layout; `shares-context` is a pure cross-link.
+
+### Style
+
+The look is data, not code. Each node/connector exposes a semantic `styleState` (agent → its state, worktree → `integration` / `dirty`, pr → its state, `merges-into` → `included` / `stale` / `conflicts`, `touches` → `read` / `edit` / `write`); a `GraphStyle` (`shared/model/style.ts`) maps `kind` base rules plus per-state overrides to theme-independent visuals (`NodeVisual`, `ConnectorVisual`). Colours are roles (`accent`, `success`, …) resolved against the Paseo theme, overridable per role via `palette`, or literal hex. `DEFAULT_STYLE` is built in; a project overrides it with `.leyline/style.json` (loaded by the daemon via `loadStyleRpc`, validated, errors surfaced in the panel status line). See `docs/style.example.json`.
 
 ## Integration branches
 

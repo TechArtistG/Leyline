@@ -2,8 +2,10 @@ import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
-import { rendererReportRpc } from "../shared/contracts";
+import { loadStyleRpc, rendererReportRpc } from "../shared/contracts";
 import { GRAPH_MODES, GRAPH_MODE_LABELS, type GraphHandle, type GraphMode } from "../shared/graph";
+import { Graph } from "../shared/model/graph";
+import { type GraphStyle, parseGraphStyle } from "../shared/model/style";
 import { mockTopology } from "./mock/topology";
 import { mountGraph } from "./web";
 
@@ -11,6 +13,8 @@ interface GraphViewProps {
   theme: PluginTheme;
   surface: "hub" | "workspace";
   caption: string;
+  /** Workspace whose `.leyline/style.json` to load; omitted on the hub. */
+  workspaceId?: string;
 }
 
 const MODES: ReadonlyArray<{ mode: GraphMode; label: string }> = GRAPH_MODES.map((mode) => ({
@@ -19,15 +23,17 @@ const MODES: ReadonlyArray<{ mode: GraphMode; label: string }> = GRAPH_MODES.map
 }));
 
 /** Hosts the WebGL graph. On native there is no renderer, so it shows a notice instead. */
-export function GraphView({ theme, surface, caption }: GraphViewProps) {
+export function GraphView({ theme, surface, caption, workspaceId }: GraphViewProps) {
   const parent = useRef<View>(null);
   const graph = useRef<GraphHandle | null>(null);
   const report = useRpc(rendererReportRpc);
+  const loadStyle = useRpc(loadStyleRpc);
   const [mode, setModeState] = useState<GraphMode>("3d-hub");
   // The renderer mounts once per theme/surface; mode changes go through `setMode` without a remount,
   // so the mount effect reads the current mode from a ref rather than depending on it.
   const modeRef = useRef<GraphMode>(mode);
   const [info, setInfo] = useState<string>(Platform.OS === "web" ? "mounting…" : "WebGL renderer is web-only");
+  const [styleError, setStyleError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
 
   const styles = useMemo(
@@ -73,11 +79,16 @@ export function GraphView({ theme, surface, caption }: GraphViewProps) {
     if (Platform.OS !== "web") return;
     let cancelled = false;
     let unsubscribe: (() => void) | undefined;
+    // One model per mount; the renderer subscribes to it and also reads whatever is in it at mount.
+    const model = new Graph();
+    model.applyPatch(mockTopology());
+    // Mount and style load run concurrently; whichever finishes second applies the style.
+    let loadedStyle: GraphStyle | undefined;
     void (async () => {
       let detail: string;
       let ok = false;
       try {
-        const handle = await mountGraph(parent.current, theme, modeRef.current);
+        const handle = await mountGraph(parent.current, theme, modeRef.current, model, loadedStyle);
         if (cancelled) {
           handle?.destroy();
           return;
@@ -89,7 +100,7 @@ export function GraphView({ theme, surface, caption }: GraphViewProps) {
           unsubscribe = handle.on((event) => {
             if (event.type === "select") setSelected(event.id);
           });
-          handle.apply(mockTopology());
+          if (loadedStyle) handle.setStyle(loadedStyle);
         }
       } catch (cause) {
         detail = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
@@ -97,14 +108,31 @@ export function GraphView({ theme, surface, caption }: GraphViewProps) {
       setInfo(detail);
       void report({ surface, ok, detail }).catch(() => undefined);
     })();
+    void (async () => {
+      let error: string | null = null;
+      try {
+        const result = await loadStyle({ workspaceId });
+        if (cancelled) return;
+        if (result.error) {
+          error = `style: ${result.error}`;
+        } else if (result.style !== null) {
+          loadedStyle = parseGraphStyle(result.style);
+          graph.current?.setStyle(loadedStyle);
+        }
+      } catch (cause) {
+        error = `style: ${cause instanceof Error ? cause.message : String(cause)}`;
+      }
+      if (!cancelled) setStyleError(error);
+    })();
     return () => {
       cancelled = true;
       unsubscribe?.();
       graph.current?.destroy();
       graph.current = null;
       setSelected(null);
+      setStyleError(null);
     };
-  }, [report, surface, theme]);
+  }, [loadStyle, report, surface, theme, workspaceId]);
 
   const setMode = useCallback((next: GraphMode) => {
     modeRef.current = next;
@@ -114,7 +142,7 @@ export function GraphView({ theme, surface, caption }: GraphViewProps) {
   const relayout = useCallback(() => graph.current?.relayout(), []);
   const fit = useCallback(() => graph.current?.fit(), []);
 
-  const status = selected ? `${selected} · ${info}` : info;
+  const status = [selected, styleError, info].filter((part): part is string => part !== null).join(" · ");
 
   return (
     <View style={styles.root}>

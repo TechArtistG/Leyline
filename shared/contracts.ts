@@ -11,3 +11,14 @@ export const rendererReportRpc = defineRpc({
   }),
   output: z.object({ received: z.literal(true) }),
 });
+
+/** Daemon reads `<workspace directory>/.leyline/style.json`; `style` is null when absent, `error` when invalid. */
+export const loadStyleRpc = defineRpc({
+  name: "leyline.style.load",
+  input: z.object({ workspaceId: z.string().optional() }),
+  output: z.object({
+    path: z.string().nullable(),
+    style: z.unknown().nullable(),
+    error: z.string().nullable(),
+  }),
+});

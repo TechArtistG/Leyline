@@ -1,0 +1,47 @@
+{
+  "palette": {
+    "accent": "#28e5f0"
+  },
+  "nodes": {
+    "agent": {
+      "color": "accent",
+      "emissive": 0.5,
+      "size": 1.2,
+      "labelAlways": true,
+      "states": {
+        "executing": { "color": "success", "emissive": 0.9, "pulse": true },
+        "attention": { "color": "warning", "ring": "warning" },
+        "error": { "color": "danger", "ring": "#ff4d4d" }
+      }
+    },
+    "worktree": {
+      "color": "muted",
+      "labelAlways": true,
+      "states": {
+        "integration": { "ring": "success", "color": "foreground" },
+        "dirty": { "ring": "warning" }
+      }
+    },
+    "pr": {
+      "color": "#f0c428",
+      "states": {
+        "merged": { "color": "success" },
+        "closed": { "color": "danger", "ring": null }
+      }
+    }
+  },
+  "connectors": {
+    "spawned": { "color": "accent", "opacity": 0.7, "directed": true },
+    "merges-into": {
+      "color": "success",
+      "opacity": 0.9,
+      "directed": true,
+      "states": { "conflicts": { "color": "danger", "dashed": true } }
+    },
+    "touches": { "color": "muted", "opacity": 0.35, "states": { "write": { "color": "warning" } } }
+  },
+  "labels": {
+    "fontSizePx": 13,
+    "color": "foreground"
+  }
+}

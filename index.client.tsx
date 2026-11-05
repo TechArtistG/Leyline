@@ -16,7 +16,9 @@ function HubScreen({ theme, host }: PluginScreenProps) {
 }
 
 function WorkspacePanel({ theme, workspaceId }: PluginWorkspacePanelProps) {
-  return <GraphView theme={theme} surface="workspace" caption={`Leyline · workspace ${workspaceId}`} />;
+  return (
+    <GraphView theme={theme} surface="workspace" workspaceId={workspaceId} caption={`Leyline · workspace ${workspaceId}`} />
+  );
 }
 
 function HubItem({ currentScreen, openScreen }: PluginSidebarItemProps) {

@@ -47,7 +47,7 @@ Leyline **observes and brokers**; it does not launch agents itself. Agents stay 
 | Host | Paseo plugin API (`@getpaseo/plugin`) | Experimental API; panels need Paseo ≥ 0.13, hooks ≥ 0.14. Developed against 0.15.2. |
 | Agent engine | Provider-agnostic via Paseo; OMP (oh-my-pi) is the primary target | Paseo ships a native OMP provider (`omp --mode rpc-ui`, JSONL over stdio). Developed against omp 18.16.0; Paseo requires ≥ 16.3.9. |
 | Renderer | **three.js** (imperative, `import("three")` behind the web gate) — [ADR-001](docs/ADR-001-renderer.md) | Spike verified: three r187 renders WebGL 2.0 inside a Paseo 0.15.2 panel on Electron |
-| Layout | `d3-force-3d`, seeded and ticked at a fixed count → deterministic | Three modes: `2d-lr` layered left→right (tree depth fixes x), `2d-hub`, `3d-hub` |
+| Layout | `d3-force-3d`, seeded and ticked at a fixed count → deterministic | Three modes: `2d-lr` layered left→right (tree depth fixes x), `2d-hub`, `3d-hub`. Only web nodes are simulated; agents ride their anchors. |
 | Styling | Paseo `PluginTheme` tokens + injected CSS | Dark-mode first, neon/cyan to match the Leyline logo |
 | Language | TypeScript, React (React Native Web on desktop) | Node 22 / npm |
 
@@ -79,8 +79,9 @@ Leyline/
 ├── index.client.tsx         # contribute(client): addScreen (hub), addWorkspacePanel, addSidebarHeaderItem, addCommandCenterItem
 ├── index.server.ts          # contribute(server): handle(rpc), addHook(...), defineAgentTool(...), subscriptions
 ├── shared/
-│   ├── graph.ts             # renderer-agnostic model: GNode / GLink / GraphPatch (Zod)
-│   └── contracts.ts         # defineRpc() schemas: graph snapshot + patches, actions (merge, send context)
+│   ├── model/               # wire.ts (Zod per-kind data), node.ts / connector.ts (base classes), nodes.ts / connectors.ts, factory.ts, graph.ts (Graph + change events), style.ts (GraphStyle, StyleResolver)
+│   ├── graph.ts             # renderer contract: GraphHandle, GraphMode
+│   └── contracts.ts         # defineRpc() schemas: rendererReport, style.load, later graph subscription + actions
 ├── client/
 │   ├── hub/                 # HubScreen: cross-host, cross-project graph (usePaseo().workspaces/agents.list({subscribe}))
 │   ├── panel/               # WorkspacePanel: graph scoped to one worktree; native (iOS/Android) list fallback
@@ -165,26 +166,7 @@ Requirement: one data model driving 2D and 3D force-directed views, custom node 
 
 **VR reality check**: stock Electron does **not** ship OpenXR (`checkout_openxr: False` in Electron's DEPS; [electron#35011](https://github.com/electron/electron/issues/35011) open since 2022). VR from the Paseo desktop app is not realistic; the practical path is serving the same renderer bundle to a WebXR-capable browser (Chrome/Edge on Windows OpenXR, Quest browser) via `navigation.openBrowser`. Design the renderer so this is a deployment choice, not a rewrite.
 
-**Abstraction** (decided regardless of library):
-
-```ts
-// shared/graph.ts
-type GNode = { id: string; kind: "host" | "repo" | "branch" | "worktree" | "agent" | "subagent" | "file" | "pr";
-               group?: string; state?: string; x?: number; y?: number; z?: number; fx?: number; fy?: number; fz?: number };
-type GLink = { id: string; source: string; target: string;
-               kind: "contains" | "branch-of" | "merges-into" | "spawned" | "shares-context" | "touches" };
-type GraphPatch = { upsertNodes?: GNode[]; removeNodes?: string[]; upsertLinks?: GLink[]; removeLinks?: string[] };
-
-// client/renderer/renderer.ts — one interface, swappable impls
-interface GraphRenderer {
-  mount(el: HTMLElement): void;
-  apply(patch: GraphPatch): void;        // keep node object identity stable so d3-force keeps positions
-  setMode(mode: "2d" | "3d" | "xr"): void;
-  on(ev: "select" | "hover" | "dragEnd", cb: (id: string) => void): void;
-  fit(): void;
-  dispose(): void;
-}
-```
+**Abstraction** (implemented; see [docs/DESIGN.md](docs/DESIGN.md) → Graph model): git is the web, agents are spiders. `shared/model/` holds the Zod wire format (`NodeData` / `ConnectorData` discriminated by kind, `GraphPatch`), the class model (`GraphNode` / `Connector` base classes, one subclass per kind, `Graph` collection with batched change events), and the loadable `GraphStyle` (`kind × state → visual`, `.leyline/style.json`). `shared/graph.ts` is the renderer contract: `GraphHandle { graph, setMode, setStyle, relayout, fit, on, destroy }`.
 
 ## Development phases
 
