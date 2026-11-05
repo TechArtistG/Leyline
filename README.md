@@ -200,7 +200,6 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the integration-branch model (rebuildab
 
 ### Later (deprioritised)
 - [ ] PR / issue / checks nodes from `githubRuntime`
-- [ ] 3D convex hull mesh per project as the grouping signifier (quickhull over member positions, padded, translucent) in place of the bounding sphere
 - [ ] File-level code graph: `file` nodes and `touches` connectors exist in the model but are hidden by default (`nodes.file.hidden`); a `server/codegraph` extractor (tree-sitter or LSP client) would populate them as an expandable sub-graph. Branches are the finest granularity for now.
 - [ ] VR mode (aspirational): serve the renderer to a WebXR browser; `@react-three/xr` or `VRButton`
 

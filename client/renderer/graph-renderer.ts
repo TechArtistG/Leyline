@@ -7,7 +7,7 @@ import type { Connector } from "../../shared/model/connector";
 import type { Graph, GraphChange } from "../../shared/model/graph";
 import type { GraphNode } from "../../shared/model/node";
 import { type GraphStyle, StyleResolver } from "../../shared/model/style";
-import type { ColorRef, ColorRole, ConnectorVisual, NodeVisual } from "../../shared/model/visual";
+import type { ColorRef, ColorRole, ConnectorVisual, LabelSettings, NodeVisual } from "../../shared/model/visual";
 import { type ConnectorKind, TREE_CONNECTOR_KINDS } from "../../shared/model/wire";
 import {
   type Cluster,
@@ -21,7 +21,7 @@ import {
   forceClusterCollide,
   measureCluster,
 } from "./clusters";
-import { type Label, createLabel } from "./labels";
+import { type Label, type LabelLayout, type LabelStyle, createLabel } from "./labels";
 
 // Typechecks without the DOM lib: declare only what this module touches.
 declare const window: { devicePixelRatio: number };
@@ -94,7 +94,6 @@ interface NodeEntry {
   mesh: Three.Mesh<Three.SphereGeometry, Three.MeshStandardMaterial> | null;
   ring: Three.Mesh<Three.TorusGeometry, Three.MeshBasicMaterial> | null;
   label: Label | null;
-  labelText: string;
 }
 interface ConnectorEntry {
   connector: Connector;
@@ -168,8 +167,10 @@ const SETTLE_TICKS = 180;
 const Z_SPREAD = 4;
 /** Distance from the anchor (group node or connected node) at which a new node starts. */
 const SPAWN_RADIUS = 3;
-const LABEL_WORLD_HEIGHT = 1.1;
-const LABEL_GAP = 0.15;
+/** World units kept above each node when framing, so a label at fit zoom stays inside the view. */
+const LABEL_FIT_HEADROOM = 1.1;
+/** LOD threshold hysteresis: labels switch tiers at ±this fraction of `allAbovePxPerUnit`. */
+const LABEL_LOD_HYSTERESIS = 0.1;
 const FIT_MARGIN = 1.1;
 const PULSE_PERIOD_MS = 1600;
 const CAMERA_3D_DISTANCE = 60;
@@ -240,8 +241,18 @@ export function createGraphRenderer(
   }
 
   function labelCss(): string {
-    return `#${colorFor(resolver.labelColor()).getHexString()}`;
+    return `#${colorFor(resolver.labels().color).getHexString()}`;
   }
+
+  // ---- labels (screen-space) -----------------------------------------------------------------
+  let labelSettings: LabelSettings = resolver.labels();
+  /** Baked once per label at the largest size it can show; the sprite scales it down per frame. */
+  let labelStyle: LabelStyle = { color: labelCss(), bakeFontSizePx: labelSettings.maxFontSizePx };
+  /** Zoom LOD state: true while `all`-tier labels show. Flips with hysteresis in the frame loop. */
+  let labelLodAll = true;
+  /** Reused per frame; `anchor` and `clearancePx` are per node, the rest per frame. */
+  const labelLayout: LabelLayout = { fontPx: labelSettings.fontSizePx, scalePerPx: 1, anchor: "above", clearancePx: 0 };
+  const labelTmp = new THREE.Vector3();
 
   // ---- renderer / scene ----------------------------------------------------------------------
   let width = Math.max(1, host.clientWidth);
@@ -685,9 +696,11 @@ export function createGraphRenderer(
   let selectedId: string | null = null;
   let hoveredId: string | null = null;
 
+  /** Hover/select always show; otherwise `labelAlways`, gated by the zoom LOD for `all`-tier labels. */
   function labelVisible(entry: NodeEntry): boolean {
     const id = entry.node.id;
-    return entry.visual.labelAlways || id === selectedId || id === hoveredId;
+    if (id === selectedId || id === hoveredId) return true;
+    return entry.visual.labelAlways && (labelLodAll || entry.visual.labelTier === "project");
   }
 
   function refreshLabel(entry: NodeEntry): void {
@@ -696,16 +709,12 @@ export function createGraphRenderer(
       return;
     }
     if (!entry.label) {
-      entry.label = createLabel(THREE, entry.node.label, {
-        color: labelCss(),
-        fontSizePx: resolver.labelFontSizePx(),
-        worldHeight: LABEL_WORLD_HEIGHT,
-      });
-      entry.labelText = entry.node.label;
+      entry.label = createLabel(THREE, entry.node.label, labelStyle);
       scene.add(entry.label.sprite);
-    } else if (entry.labelText !== entry.node.label) {
+    } else {
+      // Both compare before touching the texture: no re-bake unless text, colour or font changed.
       entry.label.setText(entry.node.label);
-      entry.labelText = entry.node.label;
+      entry.label.setStyle(labelStyle);
     }
     entry.label.sprite.visible = true;
   }
@@ -834,7 +843,6 @@ export function createGraphRenderer(
       mesh: null,
       ring: null,
       label: null,
-      labelText: "",
     };
     if (!visual.hidden) mountNode(entry);
     refreshMaterial(entry);
@@ -1314,7 +1322,7 @@ export function createGraphRenderer(
     const spheres: Array<{ x: number; y: number; z: number; r: number }> = [];
     for (const e of entries.values()) {
       if (!e.mesh?.visible || e.sim.x === undefined) continue;
-      spheres.push({ x: e.sim.x, y: e.sim.y ?? 0, z: e.sim.z ?? 0, r: e.sim.radius + LABEL_WORLD_HEIGHT });
+      spheres.push({ x: e.sim.x, y: e.sim.y ?? 0, z: e.sim.z ?? 0, r: e.sim.radius + LABEL_FIT_HEADROOM });
     }
     if (clusterStyle.show) {
       const axes: ClusterAxes = mode === "3d-hub" ? "xyz" : "xy";
@@ -1384,6 +1392,25 @@ export function createGraphRenderer(
       updateClusterHulls();
       hullsDirty = false;
     }
+    // Settle the camera first so label metrics use this frame's view, not the previous one's.
+    controls.update();
+    camera.updateMatrixWorld();
+    // projectionMatrix[1][1] is 1/tan(fov/2) (perspective) or 2·zoom/(top−bottom) (orthographic), so a
+    // view-space length ℓ covers ℓ·m11·height/2 px — divided by view depth under perspective.
+    const perspective = camera instanceof THREE.PerspectiveCamera;
+    const unitPx = (camera.projectionMatrix.elements[5] * height) / 2;
+    const pxPerUnit = perspective ? unitPx / Math.max(camera.position.distanceTo(controls.target), 1e-3) : unitPx;
+    const lodThreshold = labelSettings.allAbovePxPerUnit;
+    const wasLodAll = labelLodAll;
+    if (labelLodAll && pxPerUnit < lodThreshold * (1 - LABEL_LOD_HYSTERESIS)) labelLodAll = false;
+    else if (!labelLodAll && pxPerUnit > lodThreshold * (1 + LABEL_LOD_HYSTERESIS)) labelLodAll = true;
+    if (labelLodAll !== wasLodAll) for (const entry of entries.values()) refreshLabel(entry);
+    labelLayout.fontPx = Math.min(
+      labelSettings.maxFontSizePx,
+      Math.max(labelSettings.fontSizePx, (labelSettings.fontSizePx * pxPerUnit) / labelSettings.referencePxPerUnit),
+    );
+    // Non-attenuated sprite scale is in view-space units at depth 1 (perspective) or world units (ortho): px / unitPx.
+    labelLayout.scalePerPx = 1 / unitPx;
     const pulse = 1.06 + 0.06 * Math.sin((time / PULSE_PERIOD_MS) * Math.PI * 2);
     for (const entry of entries.values()) {
       const { sim, mesh, visual } = entry;
@@ -1401,11 +1428,20 @@ export function createGraphRenderer(
         if (mode === "3d-hub") entry.ring.quaternion.copy(camera.quaternion);
         else entry.ring.quaternion.identity();
       }
-      if (entry.label?.sprite.visible) entry.label.sprite.position.set(x, y + scale + LABEL_GAP, z);
+      const label = entry.label;
+      if (label?.sprite.visible) {
+        label.sprite.position.set(x, y, z);
+        // Silhouette from the base radius (not the pulse) at this node's own depth, so 3D labels hug near and far nodes alike.
+        const nodePxPerUnit = perspective
+          ? unitPx / Math.max(-labelTmp.set(x, y, z).applyMatrix4(camera.matrixWorldInverse).z, 1e-3)
+          : unitPx;
+        labelLayout.anchor = visual.labelAnchor;
+        labelLayout.clearancePx = visual.radius * nodePxPerUnit + labelSettings.offsetPx;
+        label.layout(labelLayout);
+      }
     }
     updateLinePositions();
     updateCones();
-    controls.update();
     renderer.render(scene, camera);
   });
 
@@ -1430,16 +1466,14 @@ export function createGraphRenderer(
       colorCache = new Map();
       const previousPadding = clusterStyle.padding;
       clusterStyle = resolver.clusterVisual();
+      labelSettings = resolver.labels();
+      // `restyleNode` → `refreshLabel` hands this to every label, which re-bakes only if it differs.
+      labelStyle = { color: labelCss(), bakeFontSizePx: labelSettings.maxFontSizePx };
       let resimulate = previousPadding !== clusterStyle.padding;
       let drawablesChanged = false;
       let batchesChanged = false;
       for (const entry of entries.values()) {
         const previousRadius = entry.visual.radius;
-        // Labels bake font and colour into their texture; drop them so the next refresh re-renders.
-        if (entry.label) {
-          entry.label.dispose();
-          entry.label = null;
-        }
         const flipped = restyleNode(entry);
         if (entry.node.layer === "web") {
           // Collision radii and the shown set feed the simulation; let it settle again.

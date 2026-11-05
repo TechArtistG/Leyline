@@ -158,7 +158,7 @@ export const DEFAULT_STYLE: GraphStyle = {
     color: "foreground",
     anchor: "above",
     offsetPx: 4,
-    lod: { allAbovePxPerUnit: 14, referencePxPerUnit: 14 },
+    lod: { allAbovePxPerUnit: 6, referencePxPerUnit: 8 },
   },
 };
 
@@ -215,14 +215,6 @@ export class StyleResolver {
       allAbovePxPerUnit: s.lod?.allAbovePxPerUnit ?? d.lod!.allAbovePxPerUnit!,
       referencePxPerUnit: s.lod?.referencePxPerUnit ?? d.lod!.referencePxPerUnit!,
     };
-  }
-
-  labelFontSizePx(): number {
-    return this.labels().fontSizePx;
-  }
-
-  labelColor(): ColorRef {
-    return this.labels().color;
   }
 
   clusterVisual(): { show: boolean; color: ColorRef; opacity: number; padding: number } {
