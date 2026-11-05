@@ -467,12 +467,18 @@ export function createGraphRenderer(
   function buildDodecahedronCluster(): Three.BufferGeometry {
     const unit = dodecahedronGeometry.getAttribute("position").array as Float32Array;
     const normals = dodecahedronGeometry.getAttribute("normal").array as Float32Array;
-    const phi = (1 + Math.sqrt(5)) / 2;
-    // Face normals of three's dodecahedron = icosahedron vertex directions.
+    // Face normals and inradius straight from the mesh: three's DodecahedronGeometry is non-indexed with
+    // flat per-triangle normals, so the 12 distinct normals are the pentagon faces and the inradius is
+    // the distance from the centre to any face plane (vertex · normal).
     const dirs: number[][] = [];
-    for (const a of [-1, 1]) for (const b of [-phi, phi]) dirs.push([0, a, b], [a, b, 0], [b, 0, a]);
-    const inradius = 0.7947; // for circumradius 1
-    const copies = [[0, 0, 0], ...dirs.map((d) => d.map((v) => (v / Math.hypot(d[0], d[1], d[2])) * inradius * 2))];
+    let inradius = 0;
+    for (let i = 0; i < normals.length; i += 3) {
+      const n = [normals[i], normals[i + 1], normals[i + 2]];
+      if (dirs.some((d) => d[0] * n[0] + d[1] * n[1] + d[2] * n[2] > 0.999)) continue;
+      dirs.push(n);
+      inradius = unit[i] * n[0] + unit[i + 1] * n[1] + unit[i + 2] * n[2];
+    }
+    const copies = [[0, 0, 0], ...dirs.map((d) => d.map((v) => v * inradius * 2))];
     const extent = 1 + inradius * 2 + 1;
     const scale = 1.2 / extent;
     const positions = new Float32Array(unit.length * copies.length);
