@@ -477,7 +477,7 @@ class TopologyBuilder implements TopologyHandle {
             kind: "worktree",
             label: worktree.branch ?? basename(worktree.path),
             group: repoId,
-            weight: 0.7,
+            weight: 1,
             repoId,
             path: worktree.path,
             branch: worktree.branch ?? DETACHED,
