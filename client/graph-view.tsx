@@ -72,10 +72,23 @@ export function GraphView({ theme, layout, surface, caption, hostId, hostLabel, 
       root: { flex: 1, backgroundColor: theme.colors.surface0 },
       stage: { flex: 1 },
       canvas: { flex: 1 },
-      cog: {
+      overlay: {
         position: "absolute" as const,
         right: 8,
         bottom: 8,
+        alignItems: "flex-end" as const,
+        gap: 6,
+      },
+      modeStack: {
+        borderWidth: 1,
+        borderColor: theme.colors.border,
+        borderRadius: 6,
+        overflow: "hidden" as const,
+        backgroundColor: theme.colors.surface1,
+      },
+      modeButton: { width: 64, paddingVertical: 6, alignItems: "center" as const, backgroundColor: theme.colors.surface1 },
+      modeButtonActive: { backgroundColor: theme.colors.accent },
+      cog: {
         width: 32,
         height: 32,
         alignItems: "center" as const,
@@ -271,34 +284,36 @@ export function GraphView({ theme, layout, surface, caption, hostId, hostLabel, 
     <View style={styles.root}>
       <View style={styles.stage}>
         <View ref={parent} style={styles.canvas} />
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Leyline settings"
-          onPress={openSettings}
-          style={styles.cog}
-        >
-          <Icon name="Settings" size={16} color={theme.colors.foreground} />
-        </Pressable>
+        <View style={styles.overlay}>
+          <View style={styles.modeStack} accessibilityRole="radiogroup" accessibilityLabel="Layout mode">
+            {MODES.map(({ mode: m, label }) => {
+              const active = m === mode;
+              return (
+                <Pressable
+                  key={m}
+                  accessibilityRole="button"
+                  accessibilityLabel={`${label} layout`}
+                  accessibilityState={{ selected: active }}
+                  onPress={() => chooseMode(m)}
+                  style={active ? [styles.modeButton, styles.modeButtonActive] : styles.modeButton}
+                >
+                  <Text style={active ? styles.buttonTextActive : styles.buttonText}>{label}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Leyline settings"
+            onPress={openSettings}
+            style={styles.cog}
+          >
+            <Icon name="Settings" size={16} color={theme.colors.foreground} />
+          </Pressable>
+        </View>
       </View>
       <View style={styles.bar}>
         <Text style={styles.caption}>{caption}</Text>
-        <View style={styles.segment} accessibilityRole="radiogroup" accessibilityLabel="Layout mode">
-          {MODES.map(({ mode: m, label }) => {
-            const active = m === mode;
-            return (
-              <Pressable
-                key={m}
-                accessibilityRole="button"
-                accessibilityLabel={`${label} layout`}
-                accessibilityState={{ selected: active }}
-                onPress={() => chooseMode(m)}
-                style={active ? [styles.button, styles.buttonActive] : styles.button}
-              >
-                <Text style={active ? styles.buttonTextActive : styles.buttonText}>{label}</Text>
-              </Pressable>
-            );
-          })}
-        </View>
         <View style={styles.segment} accessibilityRole="radiogroup" accessibilityLabel="Data source">
           {SOURCES.map(({ source: s, label }) => {
             const active = s === source;
