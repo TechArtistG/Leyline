@@ -191,6 +191,9 @@ const FIT_MARGIN = 1.1;
 const PULSE_PERIOD_MS = 1600;
 const CAMERA_3D_DISTANCE = 60;
 const ORTHO_DEPTH = 100;
+/** Far clip for both cameras; large so zooming/dollying out never clips the graph. */
+const CAMERA_FAR = 100_000;
+const CAMERA_NEAR = 0.5;
 const ORTHO_INITIAL_ZOOM = 8;
 const CLICK_SLOP_PX = 4;
 /** Ring radius as a multiple of the node radius; tube is thin so it reads as an outline. */
@@ -331,12 +334,12 @@ export function createGraphRenderer(
 
   function createCamera(target: GraphMode): Three.Camera {
     if (target === "3d-hub") {
-      const cam = new THREE.PerspectiveCamera(50, width / height, 0.1, 2000);
+      const cam = new THREE.PerspectiveCamera(50, width / height, CAMERA_NEAR, CAMERA_FAR);
       cam.position.set(0, CAMERA_3D_DISTANCE * 0.2, CAMERA_3D_DISTANCE);
       cam.lookAt(0, 0, 0);
       return cam;
     }
-    const cam = new THREE.OrthographicCamera(-width / 2, width / 2, height / 2, -height / 2, 0.1, ORTHO_DEPTH * 4);
+    const cam = new THREE.OrthographicCamera(-width / 2, width / 2, height / 2, -height / 2, -CAMERA_FAR, CAMERA_FAR);
     cam.zoom = ORTHO_INITIAL_ZOOM;
     cam.position.set(0, 0, ORTHO_DEPTH);
     cam.lookAt(0, 0, 0);
@@ -350,14 +353,14 @@ export function createGraphRenderer(
     c.dampingFactor = 0.1;
     if (target === "3d-hub") {
       c.minDistance = 2;
-      c.maxDistance = 1000;
+      c.maxDistance = CAMERA_FAR / 2;
       c.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
     } else {
       c.enableRotate = false;
       c.screenSpacePanning = true;
       c.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
       c.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_PAN };
-      c.minZoom = 0.5;
+      c.minZoom = 0.05;
       c.maxZoom = 200;
     }
     return c;
@@ -1406,8 +1409,8 @@ export function createGraphRenderer(
       fitDir.normalize();
       controls.target.copy(fitCenter);
       camera.position.copy(fitCenter).addScaledVector(fitDir, distance);
-      camera.near = Math.max(0.1, distance / 100);
-      camera.far = distance + radius * 4;
+      camera.near = CAMERA_NEAR;
+      camera.far = CAMERA_FAR;
       camera.updateProjectionMatrix();
     } else if (camera instanceof THREE.OrthographicCamera) {
       // Frustum spans ±width/2 world units at zoom 1, so zoom = pixels / world extent.
