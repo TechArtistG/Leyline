@@ -169,7 +169,10 @@ export const DEFAULT_STYLE: GraphStyle = {
     branch: {
       color: "border",
       labelAlways: false,
-      states: { default: { color: "foreground", size: 1.4, labelAlways: true, labelTier: "project" } },
+      states: {
+        default: { color: "foreground", size: 1.4, labelAlways: true, labelTier: "project" },
+        checkedOut: { color: "muted", labelAlways: true },
+      },
     },
     worktree: {
       color: "muted",

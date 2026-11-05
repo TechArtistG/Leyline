@@ -60,6 +60,7 @@ function branch(
     repoId,
     name,
     isDefault: opts.isDefault ?? false,
+    checkedOut: opts.worktreeId !== undefined,
     baseBranch: opts.base?.name,
   });
   if (opts.worktreeId) link("contains", opts.worktreeId, id);

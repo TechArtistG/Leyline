@@ -521,6 +521,7 @@ class TopologyBuilder implements TopologyHandle {
           name,
           headSha: headSha.get(name),
           isDefault: name === git?.defaultBranch,
+          checkedOut: checkedOut.has(name),
           baseBranch: bases.get(name)?.name,
         });
       };

@@ -77,6 +77,7 @@ export class BranchNode extends GraphNode<"branch"> {
   name: string;
   headSha: string | undefined;
   isDefault: boolean;
+  checkedOut: boolean;
   baseBranch: string | undefined;
 
   public constructor(data: NodeDataOf<"branch">) {
@@ -85,11 +86,12 @@ export class BranchNode extends GraphNode<"branch"> {
     this.name = data.name;
     this.headSha = data.headSha;
     this.isDefault = data.isDefault;
+    this.checkedOut = data.checkedOut;
     this.baseBranch = data.baseBranch;
   }
 
   get styleState(): string | undefined {
-    return this.isDefault ? "default" : undefined;
+    return this.isDefault ? "default" : this.checkedOut ? "checkedOut" : undefined;
   }
 
   toData(): NodeDataOf<"branch"> {
@@ -99,12 +101,13 @@ export class BranchNode extends GraphNode<"branch"> {
       name: this.name,
       headSha: this.headSha,
       isDefault: this.isDefault,
+      checkedOut: this.checkedOut,
       baseBranch: this.baseBranch,
     });
   }
 
   protected applyData(data: NodeDataOf<"branch">): boolean {
-    return syncFields(this, data, ["repoId", "name", "headSha", "isDefault", "baseBranch"]);
+    return syncFields(this, data, ["repoId", "name", "headSha", "isDefault", "checkedOut", "baseBranch"]);
   }
 }
 

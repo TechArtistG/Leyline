@@ -53,6 +53,8 @@ export const BranchNodeData = NodeBase.extend({
   headSha: z.string().optional(),
   /** The repository's default branch (origin/HEAD, else main/master). */
   isDefault: z.boolean(),
+  /** Checked out in some worktree. */
+  checkedOut: z.boolean(),
   /** Branch this one was branched from, when known (see `base-of` connector). */
   baseBranch: z.string().optional(),
 });
