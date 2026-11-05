@@ -1,5 +1,6 @@
 import type { Connector } from "./connector";
 import {
+  BaseOfConnector,
   BranchOfConnector,
   ContainsConnector,
   MergesIntoConnector,
@@ -56,6 +57,8 @@ export function createConnector(data: ConnectorData): Connector {
       return new ContainsConnector(data);
     case "branch-of":
       return new BranchOfConnector(data);
+    case "base-of":
+      return new BaseOfConnector(data);
     case "spawned":
       return new SpawnedConnector(data);
     case "touches":

@@ -108,3 +108,12 @@ Versioned in the repo so every worktree, clone, and agent sees the same declarat
 
 - `leyline_merge_into_integration({ source })` — refuses sources not declared in the manifest; triggers a rebuild and returns the per-source state.
 - `leyline_request_context({ agentId })` — summary of another agent's recent timeline and touched files; recorded as a `shares-context` edge.
+
+## Branch bases
+
+Git has no first-class "branched from" relation, so Leyline derives it from two sources, explicit first:
+
+1. **Config** — `branch.<name>.leylinebase` (Leyline's own key) or a local upstream (`branch.<name>.remote = .` + `branch.<name>.merge`). The daemon records `leylinebase` from Paseo's `worktree.create.before/after` hooks whenever a worktree is branched off, so anything created through Paseo is exact.
+2. **Inferred** — one `git rev-list --topo-order --parents --branches` dump; a single topo pass propagates per-commit branch-containment bitsets child→parent; for each branch, walk first-parent from the tip until a commit contained by another branch that does not itself contain this tip (excludes branches this one was merged into). Tie-break: a branch whose tip is that commit, then the default branch, then name order. `commitsAhead` = steps walked.
+
+The default branch (`origin/HEAD`, else `main`/`master`) has no base and hangs off the repo (`branch-of`); every other branch with a known base hangs off its base via a `base-of` connector (source = base, target = derived; a tree edge, so layered depth follows lineage; dashed when `via: "inferred"`). Branches with no resolvable base keep the `branch-of` edge from the repo. Checked-out branches additionally keep `contains` from their worktree.

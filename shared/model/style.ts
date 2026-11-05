@@ -131,7 +131,11 @@ export const DEFAULT_STYLE: GraphStyle = {
     universe: { color: "border", emissive: 0.2, labelAlways: true, labelTier: "project" },
     host: { color: "muted", labelAlways: true, labelTier: "project" },
     repo: { color: "muted", labelAlways: true, labelTier: "project" },
-    branch: { color: "border", labelAlways: false },
+    branch: {
+      color: "border",
+      labelAlways: false,
+      states: { default: { color: "foreground", size: 1.4, labelAlways: true, labelTier: "project" } },
+    },
     worktree: {
       color: "muted",
       labelAlways: true,
@@ -174,6 +178,13 @@ export const DEFAULT_STYLE: GraphStyle = {
   connectors: {
     contains: { color: "muted", opacity: 0.85, width: 1.5 },
     "branch-of": { color: "muted", opacity: 0.7, width: 1.25, dashed: true },
+    "base-of": {
+      color: "foreground",
+      opacity: 0.8,
+      width: 1.5,
+      directed: true,
+      states: { inferred: { dashed: true, opacity: 0.6 } },
+    },
     spawned: { color: "accent", opacity: 0.9, width: 1.5, directed: true },
     touches: { color: "muted", opacity: 0.7, width: 1.25, states: { write: { color: "warning" }, edit: { color: "warning" } } },
     "merges-into": {

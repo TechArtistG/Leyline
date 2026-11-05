@@ -45,11 +45,16 @@ export const RepoNodeData = NodeBase.extend({
   rootPath: z.string(),
   remoteUrl: z.string().optional(),
 });
+export const BASE_SOURCES = ["config", "inferred"] as const;
 export const BranchNodeData = NodeBase.extend({
   kind: z.literal("branch"),
   repoId: z.string(),
   name: z.string(),
   headSha: z.string().optional(),
+  /** The repository's default branch (origin/HEAD, else main/master). */
+  isDefault: z.boolean(),
+  /** Branch this one was branched from, when known (see `base-of` connector). */
+  baseBranch: z.string().optional(),
 });
 export const WorktreeNodeData = NodeBase.extend({
   kind: z.literal("worktree"),
@@ -121,6 +126,14 @@ const ConnectorBase = z.object({
 
 export const ContainsConnectorData = ConnectorBase.extend({ kind: z.literal("contains") });
 export const BranchOfConnectorData = ConnectorBase.extend({ kind: z.literal("branch-of") });
+/** `source` is the base branch, `target` the branch derived from it. */
+export const BaseOfConnectorData = ConnectorBase.extend({
+  kind: z.literal("base-of"),
+  /** Where the relation came from: git config `branch.<name>.leylinebase` or fork-point inference. */
+  via: z.enum(BASE_SOURCES),
+  /** Commits on the derived branch since the fork point. */
+  commitsAhead: z.number().int().nonnegative(),
+});
 export const SpawnedConnectorData = ConnectorBase.extend({ kind: z.literal("spawned") });
 export const TouchesConnectorData = ConnectorBase.extend({
   kind: z.literal("touches"),
@@ -138,6 +151,7 @@ export const SharesContextConnectorData = ConnectorBase.extend({
 export const ConnectorData = z.discriminatedUnion("kind", [
   ContainsConnectorData,
   BranchOfConnectorData,
+  BaseOfConnectorData,
   SpawnedConnectorData,
   TouchesConnectorData,
   MergesIntoConnectorData,
@@ -148,7 +162,7 @@ export type ConnectorKind = ConnectorData["kind"];
 export type ConnectorDataOf<K extends ConnectorKind> = Extract<ConnectorData, { kind: K }>;
 
 /** Connector kinds that define hierarchy (depth for the layered layout). */
-export const TREE_CONNECTOR_KINDS: readonly ConnectorKind[] = ["contains", "spawned", "branch-of", "touches", "merges-into"];
+export const TREE_CONNECTOR_KINDS: readonly ConnectorKind[] = ["contains", "spawned", "branch-of", "base-of", "touches", "merges-into"];
 
 export const GraphPatch = z.object({
   upsertNodes: z.array(NodeData).optional(),

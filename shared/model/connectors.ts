@@ -40,6 +40,29 @@ export class BranchOfConnector extends Connector<"branch-of"> {
   }
 }
 
+export class BaseOfConnector extends Connector<"base-of"> {
+  via: ConnectorDataOf<"base-of">["via"];
+  commitsAhead: number;
+
+  public constructor(data: ConnectorDataOf<"base-of">) {
+    super(data);
+    this.via = data.via;
+    this.commitsAhead = data.commitsAhead;
+  }
+
+  get styleState(): string | undefined {
+    return this.via;
+  }
+
+  toData(): ConnectorDataOf<"base-of"> {
+    return { ...this.baseData(), via: this.via, commitsAhead: this.commitsAhead };
+  }
+
+  protected applyData(data: ConnectorDataOf<"base-of">): boolean {
+    return syncFields(this, data, ["via", "commitsAhead"]);
+  }
+}
+
 export class SpawnedConnector extends Connector<"spawned"> {
   public constructor(data: ConnectorDataOf<"spawned">) {
     super(data);
@@ -124,6 +147,7 @@ export class SharesContextConnector extends Connector<"shares-context"> {
 export type ConnectorByKind = {
   contains: ContainsConnector;
   "branch-of": BranchOfConnector;
+  "base-of": BaseOfConnector;
   spawned: SpawnedConnector;
   touches: TouchesConnector;
   "merges-into": MergesIntoConnector;

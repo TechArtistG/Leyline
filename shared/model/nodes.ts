@@ -76,24 +76,35 @@ export class BranchNode extends GraphNode<"branch"> {
   repoId: string;
   name: string;
   headSha: string | undefined;
+  isDefault: boolean;
+  baseBranch: string | undefined;
 
   public constructor(data: NodeDataOf<"branch">) {
     super(data);
     this.repoId = data.repoId;
     this.name = data.name;
     this.headSha = data.headSha;
+    this.isDefault = data.isDefault;
+    this.baseBranch = data.baseBranch;
   }
 
   get styleState(): string | undefined {
-    return undefined;
+    return this.isDefault ? "default" : undefined;
   }
 
   toData(): NodeDataOf<"branch"> {
-    return compact({ ...this.baseData(), repoId: this.repoId, name: this.name, headSha: this.headSha });
+    return compact({
+      ...this.baseData(),
+      repoId: this.repoId,
+      name: this.name,
+      headSha: this.headSha,
+      isDefault: this.isDefault,
+      baseBranch: this.baseBranch,
+    });
   }
 
   protected applyData(data: NodeDataOf<"branch">): boolean {
-    return syncFields(this, data, ["repoId", "name", "headSha"]);
+    return syncFields(this, data, ["repoId", "name", "headSha", "isDefault", "baseBranch"]);
   }
 }
 

@@ -467,9 +467,16 @@ class TopologyBuilder implements TopologyHandle {
       });
       link("contains", hostNodeId, repoId);
 
-      const branchNode = (name: string, weight: number): string =>
-        node({
-          id: `branch:${project.id}/${name}`,
+      const bases = new Map<string, NonNullable<NonNullable<ListBranchesOutput["branches"]>[number]["base"]>>();
+      if (git?.branches) for (const branch of git.branches) if (branch.base) bases.set(branch.name, branch.base);
+      const known = new Set<string>(git?.branches?.map((branch) => branch.name) ?? []);
+      const branchIds = new Set<string>();
+      const branchNode = (name: string, weight: number): string => {
+        const id = `branch:${project.id}/${name}`;
+        if (branchIds.has(id)) return id;
+        branchIds.add(id);
+        return node({
+          id,
           kind: "branch",
           label: name,
           group: repoId,
@@ -477,12 +484,31 @@ class TopologyBuilder implements TopologyHandle {
           repoId,
           name,
           headSha: headSha.get(name),
+          isDefault: name === git?.defaultBranch,
+          baseBranch: bases.get(name)?.name,
         });
+      };
+
+      // Checked-out branches hang off their worktree; the default branch always hangs off the repo too.
       for (const [name, worktreeId] of checkedOut) link("contains", worktreeId, branchNode(name, 1));
       if (git?.branches) {
         for (const branch of git.branches) {
-          if (checkedOut.has(branch.name)) continue;
-          link("branch-of", repoId, branchNode(branch.name, 0.6));
+          const isDefault = branch.name === git.defaultBranch;
+          const base = branch.base && known.has(branch.base.name) ? branch.base : null;
+          const branchId = branchNode(branch.name, isDefault ? 1.2 : 0.6);
+          if (base) {
+            const baseId = branchNode(base.name, base.name === git.defaultBranch ? 1.2 : 0.6);
+            const id = `base-of:${baseId}->${branchId}`;
+            connectors.set(id, {
+              id,
+              kind: "base-of",
+              source: baseId,
+              target: branchId,
+              via: base.via,
+              commitsAhead: base.commitsAhead,
+            });
+          }
+          if (isDefault || (!base && !checkedOut.has(branch.name))) link("branch-of", repoId, branchId);
         }
       }
     }

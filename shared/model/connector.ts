@@ -4,6 +4,7 @@ import type { ConnectorData, ConnectorDataOf, ConnectorKind } from "./wire";
 export const KIND_DISTANCE: Record<ConnectorKind, number> = {
   contains: 6,
   "branch-of": 5,
+  "base-of": 5,
   spawned: 4,
   touches: 3,
   "merges-into": 8,

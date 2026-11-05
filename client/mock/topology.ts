@@ -37,6 +37,37 @@ function mergesInto(source: string, target: string, state: IntegrationState): vo
   connector({ id: `merges-into:${source}->${target}`, source, target, kind: "merges-into", state });
 }
 
+function baseOf(source: string, target: string, via: ConnectorDataOf<"base-of">["via"], commitsAhead: number): void {
+  connector({ id: `base-of:${source}->${target}`, source, target, kind: "base-of", via, commitsAhead });
+}
+
+/**
+ * Branch node in `repoId`. Checked-out branches hang off `worktreeId`; the default branch (and
+ * branches with no known base) hang off the repo; based branches hang off their base via `base-of`.
+ */
+function branch(
+  repoId: string,
+  name: string,
+  opts: { worktreeId?: string; isDefault?: boolean; base?: { name: string; via: "config" | "inferred"; commitsAhead: number } } = {},
+): string {
+  const repoSlug = repoId.slice("repo:".length);
+  const id = node({
+    id: `branch:${repoSlug}/${name}`,
+    kind: "branch",
+    label: name,
+    group: repoId,
+    weight: opts.isDefault ? 1.2 : opts.worktreeId ? 1 : 0.6,
+    repoId,
+    name,
+    isDefault: opts.isDefault ?? false,
+    baseBranch: opts.base?.name,
+  });
+  if (opts.worktreeId) link("contains", opts.worktreeId, id);
+  if (opts.base) baseOf(`branch:${repoSlug}/${opts.base.name}`, id, opts.base.via, opts.base.commitsAhead);
+  if (opts.isDefault || (!opts.base && !opts.worktreeId)) link("branch-of", repoId, id);
+  return id;
+}
+
 function repo(slug: string, label: string): string {
   const id = node({
     id: `repo:${slug}`,
@@ -135,19 +166,18 @@ function build(): void {
 
   // GR_Agentic_Sim_Team_Infra: two feature worktrees merging into an integration worktree.
   const grInfra = repo("gr-infra", "GR_Agentic_Sim_Team_Infra");
-  const grMain = node({
-    id: "branch:gr-infra/main",
-    kind: "branch",
-    label: "main",
-    group: grInfra,
-    weight: 0.8,
-    repoId: grInfra,
-    name: "main",
-  });
+  const grMain = branch(grInfra, "main", { isDefault: true });
   const grReviewRig = worktree(grInfra, "feature-kitbash-review-rig", "feature/kitbash-review-rig", { dirty: true, ahead: 4 });
   const grMaterials = worktree(grInfra, "feature-kitbash-materials", "feature/kitbash-materials", { ahead: 2, behind: 1 });
   const grIntegration = worktree(grInfra, "integration-kitbash", "integration/kitbash", { isIntegration: true, ahead: 6 });
   link("branch-of", grIntegration, grMain);
+  branch(grInfra, "integration/kitbash", { worktreeId: grIntegration, base: { name: "main", via: "config", commitsAhead: 6 } });
+  branch(grInfra, "feature/kitbash-review-rig", { worktreeId: grReviewRig, base: { name: "main", via: "config", commitsAhead: 4 } });
+  // Branched from the integration branch rather than main.
+  branch(grInfra, "feature/kitbash-materials", {
+    worktreeId: grMaterials,
+    base: { name: "integration/kitbash", via: "config", commitsAhead: 3 },
+  });
   mergesInto(grReviewRig, grIntegration, "included");
   mergesInto(grMaterials, grIntegration, "stale");
 
@@ -166,6 +196,8 @@ function build(): void {
   const gridMain = worktree(grid, "main", "main");
   const gridCache = worktree(grid, "feature-scene-graph-cache", "feature/scene-graph-cache", { dirty: true, ahead: 3 });
   link("branch-of", gridCache, gridMain);
+  branch(grid, "main", { worktreeId: gridMain, isDefault: true });
+  branch(grid, "feature/scene-graph-cache", { worktreeId: gridCache, base: { name: "main", via: "inferred", commitsAhead: 3 } });
   agent(gridMain, 1, "release notes", "idle");
   const gridCache1 = agent(gridCache, 1, "cache implementer", "executing");
   agent(gridCache, 2, "bench runner", "error");
@@ -175,6 +207,7 @@ function build(): void {
   // isaac-sim-mcp
   const isaac = repo("isaac-sim-mcp", "isaac-sim-mcp");
   const isaacMain = worktree(isaac, "main", "main");
+  branch(isaac, "main", { worktreeId: isaacMain, isDefault: true });
   const isaac1 = agent(isaacMain, 1, "mcp tool author", "thinking");
 
   // Leyline
@@ -182,6 +215,8 @@ function build(): void {
   const leylineMain = worktree(leyline, "main", "main");
   const leylineLayout = worktree(leyline, "feature-force-layout", "feature/force-layout", { dirty: true, ahead: 9, behind: 2 });
   link("branch-of", leylineLayout, leylineMain);
+  branch(leyline, "main", { worktreeId: leylineMain, isDefault: true });
+  branch(leyline, "feature/force-layout", { worktreeId: leylineLayout, base: { name: "main", via: "config", commitsAhead: 9 } });
   agent(leylineMain, 1, "docs keeper", "idle");
   const leyline1 = agent(leylineLayout, 1, "renderer", "executing");
   const leyline2 = agent(leylineLayout, 2, "fixtures & panel", "attention");

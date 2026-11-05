@@ -39,11 +39,24 @@ export const listBranchesRpc = defineRpc({
           headSha: z.string(),
           /** Absolute path of the worktree that has this branch checked out, if any. */
           worktreePath: z.string().nullable(),
+          /**
+           * Branch this one was branched from: git config `branch.<name>.leylinebase` (or a local
+           * `branch.<name>.merge` upstream) when set, otherwise inferred from the fork point.
+           */
+          base: z
+            .object({
+              name: z.string(),
+              via: z.enum(["config", "inferred"]),
+              commitsAhead: z.number().int().nonnegative(),
+            })
+            .nullable(),
         }),
       )
       .nullable(),
     /** Worktrees known to git (`git worktree list`), including the main checkout. */
     worktrees: z.array(z.object({ path: z.string(), branch: z.string().nullable(), headSha: z.string() })),
+    /** `origin/HEAD` target, else `main`/`master` if present, else null. */
+    defaultBranch: z.string().nullable(),
     error: z.string().nullable(),
   }),
 });
