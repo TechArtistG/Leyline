@@ -9,6 +9,18 @@ import type { GraphNode } from "../../shared/model/node";
 import { type GraphStyle, StyleResolver } from "../../shared/model/style";
 import type { ColorRef, ColorRole, ConnectorVisual, NodeVisual } from "../../shared/model/visual";
 import { type ConnectorKind, TREE_CONNECTOR_KINDS } from "../../shared/model/wire";
+import {
+  type Cluster,
+  type ClusterAxes,
+  HULL_SAMPLES,
+  ROOT_CLUSTER,
+  clusterHull2d,
+  countClusterOverlaps,
+  createCluster,
+  forceCluster,
+  forceClusterCollide,
+  measureCluster,
+} from "./clusters";
 import { type Label, createLabel } from "./labels";
 
 // Typechecks without the DOM lib: declare only what this module touches.
@@ -57,6 +69,8 @@ interface SimNode extends D3.SimulationNode {
   id: string;
   /** Sphere radius in world units (from the resolved visual); drives collision and charge. */
   radius: number;
+  /** Repo id this node is contained in (spiders: their anchor's), or `ROOT_CLUSTER` above the repos. */
+  clusterId: string;
 }
 interface SimLink extends D3.SimulationLink<SimNode> {
   id: string;
@@ -76,7 +90,8 @@ interface NodeEntry {
   tween: { from: Point; start: number } | null;
   /** Spider only: frame stamp of the last placement, so anchor chains resolve once per frame. */
   placedFrame: number;
-  mesh: Three.Mesh<Three.SphereGeometry, Three.MeshStandardMaterial>;
+  /** Null while `visual.hidden`: not drawn, not picked, not simulated. Ring and label follow it. */
+  mesh: Three.Mesh<Three.SphereGeometry, Three.MeshStandardMaterial> | null;
   ring: Three.Mesh<Three.TorusGeometry, Three.MeshBasicMaterial> | null;
   label: Label | null;
   labelText: string;
@@ -84,14 +99,26 @@ interface NodeEntry {
 interface ConnectorEntry {
   connector: Connector;
   link: SimLink;
-  /** Both endpoints are web nodes → the link is a simulation force; otherwise only drawn. */
+  /** Both endpoints are shown web nodes → the link is a simulation force; otherwise only drawn. */
   simulated: boolean;
-  /** `contains` into a spider is not drawn: the spider already sits on its anchor. */
+  /** Hidden endpoints hide the connector; `contains` into a spider is not drawn either: the spider already sits on its anchor. */
   drawn: boolean;
   visual: ConnectorVisual;
   revision: number;
-  /** Arrowhead at the target when `visual.directed`. */
+  /** Arrowhead at the target when `visual.directed` and drawn. */
   cone: Three.Mesh<Three.ConeGeometry, Three.MeshBasicMaterial> | null;
+}
+/** Hull drawn around one non-root cluster: a flat outline + fill in 2D modes, a translucent sphere in 3D. */
+interface ClusterDrawable {
+  cluster: Cluster<SimNode>;
+  fill: Three.Mesh<Three.BufferGeometry, Three.MeshBasicMaterial>;
+  /** 2D only: hull outline sharing the fill's position attribute. */
+  outline: Three.LineLoop<Three.BufferGeometry, Three.LineBasicMaterial> | null;
+  /** 3D only: faint wireframe over the sphere. */
+  wire: Three.Mesh<Three.SphereGeometry, Three.MeshBasicMaterial> | null;
+  /** 2D only: hull vertices as x,y pairs, capacity `extent.length × HULL_SAMPLES`. */
+  hull: Float32Array;
+  positions: Float32Array;
 }
 /** One `LineSegments` draw: solid or dashed connectors, each with its own interleaved buffers. */
 interface LineBatch {
@@ -110,16 +137,29 @@ interface Point {
 const SEED = 0x1e71;
 /** World units per `Connector.distance` unit; spheres are 0.4–1.6 units, so links of 6–20 read as a graph, not a blob. */
 const DISTANCE_SCALE = 2;
-const CHARGE_STRENGTH = -30;
+const CHARGE_STRENGTH = -18;
 const CHARGE_DISTANCE_MAX = 60;
 const COLLIDE_PADDING = 0.6;
-/** `2d-lr`: x per containment depth; links only pull y, weak gravity keeps columns compact. */
+/** Hub modes: `contains` links from the root cluster into a repo are stretched so repo clusters have room to spread. */
+const HOST_REPO_DISTANCE_SCALE = 2.5;
+/** Pull of each web node toward its cluster centroid (hub modes). */
+const CLUSTER_STRENGTH = 0.3;
+/** Fraction of a cluster-pair overlap resolved per tick (velocity space; d3 scales velocity by 0.6 before integrating). */
+const CLUSTER_COLLIDE_STRENGTH = 0.8;
+/** `2d-lr`: x per containment depth; links only pull y, each node is held in its cluster's y band. */
 const LR_COLUMN_SPACING = 12;
 const LR_ROW_SPACING = 3;
 const LR_LINK_DISTANCE = 4;
 const LR_LINK_STRENGTH = 0.3;
 const LR_CHARGE_STRENGTH = -10;
-const LR_Y_STRENGTH = 0.05;
+const LR_BAND_STRENGTH = 0.3;
+/** Band height = (tallest column in the cluster + this) × row spacing. */
+const LR_BAND_SLACK_ROWS = 1;
+/** 2D hulls sit this far behind the z = 0 node plane (fill), with the outline halfway up. */
+const HULL_Z = -1;
+/** Outline opacity relative to the fill opacity (2D), and wireframe opacity relative to the sphere (3D). */
+const HULL_OUTLINE_OPACITY = 2.5;
+const HULL_WIRE_OPACITY = 0.35;
 const TREE_KINDS: ReadonlySet<ConnectorKind> = new Set(TREE_CONNECTOR_KINDS);
 const ALPHA_MIN = 0.001;
 /** Ticks until the simulation settles (`alpha < ALPHA_MIN`); one tick per frame → ~3 s at 60 Hz. */
@@ -311,7 +351,8 @@ export function createGraphRenderer(
   const defaultLinkStrength = linkForce.strength();
   const chargeForce = d3.forceManyBody<SimNode>().distanceMax(CHARGE_DISTANCE_MAX);
   const centerForce = d3.forceCenter<SimNode>(0, 0, 0);
-  const gravityY = d3.forceY<SimNode>(0).strength(LR_Y_STRENGTH);
+  /** `2d-lr`: each node is held in its cluster's y band (bands are assigned by `prepareLayout`). */
+  const bandForce = d3.forceY<SimNode>((n) => clusterById.get(n.clusterId)?.bandY ?? 0).strength(LR_BAND_STRENGTH);
   const simulation = d3
     .forceSimulation<SimNode>([], mode === "3d-hub" ? 3 : 2)
     .randomSource(lcg(SEED))
@@ -325,15 +366,101 @@ export function createGraphRenderer(
     .stop();
   let fitPending = false;
 
+  // ---- clusters ------------------------------------------------------------------------------
+  /** Every cluster with a shown member, sorted by id (the forces iterate in this order); root included. */
+  let clusters: Cluster<SimNode>[] = [];
+  const clusterById = new Map<string, Cluster<SimNode>>();
+  let clusterStyle = resolver.clusterVisual();
+
+  function clusterAxes(): ClusterAxes {
+    return mode === "2d-lr" ? "y" : mode === "3d-hub" ? "xyz" : "xy";
+  }
+
+  /**
+   * Nearest `repo` reached by walking incoming tree connectors (except `merges-into`, which flows
+   * sideways into integration targets and PRs). A node with no tree parent (a PR hangs only off
+   * `merges-into`) continues through its `group`; `ROOT_CLUSTER` when the walk ends above the repos.
+   */
+  function repoAncestor(id: string, memo: Map<string, string>, trail: Set<string>): string {
+    const known = memo.get(id);
+    if (known !== undefined) return known;
+    const node = graph.nodes.get(id);
+    let result = ROOT_CLUSTER;
+    if (node?.kind === "repo") {
+      result = id;
+    } else if (node && !trail.has(id)) {
+      trail.add(id);
+      let parentId: string | undefined;
+      for (const c of graph.connectorsOf(id)) {
+        if (c.target !== id || c.kind === "merges-into" || !TREE_KINDS.has(c.kind)) continue;
+        if (parentId === undefined || c.source < parentId) parentId = c.source;
+      }
+      if (parentId === undefined && node.group !== undefined && node.group !== id) parentId = node.group;
+      if (parentId !== undefined) result = repoAncestor(parentId, memo, trail);
+    }
+    memo.set(id, result);
+    return result;
+  }
+
+  /** Reassign every node's cluster and rebuild the cluster list (members: shown web nodes; extent: plus their spiders). */
+  function rebuildClusters(): void {
+    const memo = new Map<string, string>();
+    clusterById.clear();
+    const clusterFor = (id: string): Cluster<SimNode> => {
+      let c = clusterById.get(id);
+      if (!c) clusterById.set(id, (c = createCluster<SimNode>(id)));
+      return c;
+    };
+    for (const e of entries.values()) {
+      if (e.node.layer !== "web") continue;
+      e.sim.clusterId = repoAncestor(e.node.id, memo, new Set());
+      if (!e.mesh) continue;
+      const c = clusterFor(e.sim.clusterId);
+      c.members.push(e.sim);
+      c.extent.push(e.sim);
+    }
+    for (const e of entries.values()) {
+      if (e.node.layer !== "spider") continue;
+      // Follow the anchor chain to a shown web node; a spider that resolves to nothing is not drawn.
+      let anchor: NodeEntry | undefined = e;
+      let hops = 0;
+      while (anchor && anchor.node.layer === "spider" && anchor.mesh && hops++ <= entries.size) {
+        anchor = anchor.anchorId !== undefined ? entries.get(anchor.anchorId) : undefined;
+      }
+      const web = anchor?.node.layer === "web" && anchor.mesh ? anchor : undefined;
+      e.sim.clusterId = web ? web.sim.clusterId : ROOT_CLUSTER;
+      if (web && e.mesh) clusterFor(e.sim.clusterId).extent.push(e.sim);
+    }
+    clusters = [...clusterById.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    rebuildClusterDrawables();
+  }
+
+  /** Overlapping cluster pairs under the current mode's measure; debug hook for the orchestrator. */
+  function clusterOverlaps(): number {
+    return countClusterOverlaps(clusters, clusterStyle.padding, clusterAxes());
+  }
+
   function configureForces(): void {
+    const axes = clusterAxes();
+    const clusterCollide = forceClusterCollide(() => clusters, () => clusterStyle.padding, CLUSTER_COLLIDE_STRENGTH, axes);
     if (mode === "2d-lr") {
       linkForce.distance(LR_LINK_DISTANCE).strength(LR_LINK_STRENGTH);
       chargeForce.strength(LR_CHARGE_STRENGTH);
-      simulation.force("center", null).force("y", gravityY);
+      simulation.force("center", null).force("y", bandForce).force("cluster", null).force("clusterCollide", clusterCollide);
     } else {
-      linkForce.distance((l) => l.distance * DISTANCE_SCALE).strength(defaultLinkStrength);
+      linkForce
+        .distance((l) => {
+          // A repo is the root of its own cluster; its `contains` link from host/universe gets the extra room.
+          const intoRepo = l.kind === "contains" && l.target.clusterId !== ROOT_CLUSTER && l.target.clusterId === l.target.id;
+          return l.distance * DISTANCE_SCALE * (intoRepo ? HOST_REPO_DISTANCE_SCALE : 1);
+        })
+        .strength(defaultLinkStrength);
       chargeForce.strength(CHARGE_STRENGTH);
-      simulation.force("center", centerForce).force("y", null);
+      simulation
+        .force("center", centerForce)
+        .force("y", null)
+        .force("cluster", forceCluster(() => clusters, CLUSTER_STRENGTH, axes))
+        .force("clusterCollide", clusterCollide);
     }
   }
   configureForces();
@@ -373,7 +500,8 @@ export function createGraphRenderer(
 
   /**
    * Mode-specific constraints that must be in place before d3 (re)initialises node positions:
-   * `2d-lr` pins x per column and seeds y by index within the column; hub modes release x.
+   * `2d-lr` pins x per column, gives each cluster a contiguous y band (root in the middle) and
+   * seeds y by index within the cluster's column; hub modes release x.
    */
   function prepareLayout(): void {
     if (mode !== "2d-lr") {
@@ -383,17 +511,44 @@ export function createGraphRenderer(
     const depth = treeDepths();
     let columns = 0;
     for (const d of depth.values()) if (d + 1 > columns) columns = d + 1;
-    const rows: number[] = new Array<number>(columns).fill(0);
-    for (const n of nodeList) rows[depth.get(n) ?? 0]++;
-    const placed: number[] = new Array<number>(columns).fill(0);
+    const ordered = clusters.filter((c) => c.id !== ROOT_CLUSTER);
+    const root = clusterById.get(ROOT_CLUSTER);
+    if (root) ordered.splice(ordered.length >> 1, 0, root);
+    // Band height follows the cluster's tallest column; bands stack with the hull padding between.
+    const rows = new Map<Cluster<SimNode>, number[]>();
+    const heights: number[] = [];
+    let total = Math.max(0, ordered.length - 1) * clusterStyle.padding;
+    for (const c of ordered) {
+      const counts: number[] = new Array<number>(columns).fill(0);
+      let tallest = 0;
+      for (const n of c.members) {
+        const count = ++counts[depth.get(n) ?? 0];
+        if (count > tallest) tallest = count;
+      }
+      rows.set(c, counts);
+      const h = (tallest + LR_BAND_SLACK_ROWS) * LR_ROW_SPACING;
+      heights.push(h);
+      total += h;
+    }
+    const placed = new Map<Cluster<SimNode>, number[]>();
+    let edge = -total / 2;
+    ordered.forEach((c, i) => {
+      c.bandY = edge + heights[i] / 2;
+      edge += heights[i] + clusterStyle.padding;
+      placed.set(c, new Array<number>(columns).fill(0));
+    });
     for (const n of nodeList) {
       const column = depth.get(n) ?? 0;
       n.fx = (column - (columns - 1) / 2) * LR_COLUMN_SPACING;
+      const c = clusterById.get(n.clusterId);
+      const counts = c ? rows.get(c) : undefined;
+      const slots = c ? placed.get(c) : undefined;
+      if (!c || !counts || !slots) continue;
       if (n.y === undefined || Number.isNaN(n.y)) {
-        n.y = (placed[column] - (rows[column] - 1) / 2) * LR_ROW_SPACING;
+        n.y = c.bandY + (slots[column] - (counts[column] - 1) / 2) * LR_ROW_SPACING;
         n.vy = 0;
       }
-      placed[column]++;
+      slots[column]++;
     }
   }
 
@@ -422,12 +577,17 @@ export function createGraphRenderer(
     nodeList = [];
     meshes = [];
     for (const e of entries.values()) {
+      if (!e.mesh) continue;
       if (e.node.layer === "web") nodeList.push(e.sim);
       meshes.push(e.mesh);
     }
     linkList = [];
-    for (const e of connectorEntries.values()) if (e.simulated) linkList.push(e.link);
+    for (const e of connectorEntries.values()) {
+      classifyConnector(e);
+      if (e.simulated) linkList.push(e.link);
+    }
     rebuildAnchorIndex();
+    rebuildClusters();
     prepareLayout();
     simulation.nodes(nodeList);
     enforceDimensions();
@@ -442,11 +602,13 @@ export function createGraphRenderer(
   let frame = 0;
   /** Timestamp of the last animation frame; tweens started between frames use it as their origin. */
   let lastFrameTime = 0;
+  /** Set when a spider's position changed this frame, so hulls (which include spiders) refresh. */
+  let spiderMoved = false;
 
   function rebuildAnchorIndex(): void {
     anchoredBy.clear();
     for (const e of entries.values()) {
-      if (e.anchorId === undefined) continue;
+      if (e.anchorId === undefined || !e.mesh) continue;
       let list = anchoredBy.get(e.anchorId);
       if (!list) anchoredBy.set(e.anchorId, (list = []));
       list.push(e.node.id);
@@ -455,6 +617,7 @@ export function createGraphRenderer(
   }
 
   function spiderVisible(entry: NodeEntry, visible: boolean): void {
+    if (!entry.mesh) return;
     entry.mesh.visible = visible;
     if (entry.ring) entry.ring.visible = visible;
     if (entry.label) entry.label.sprite.visible = visible && labelVisible(entry);
@@ -465,7 +628,7 @@ export function createGraphRenderer(
    * resolve recursively, once per frame), blended from the previous anchor while a tween runs.
    */
   function placeSpider(entry: NodeEntry, time: number): void {
-    if (entry.placedFrame === frame) return;
+    if (entry.placedFrame === frame || !entry.mesh) return;
     entry.placedFrame = frame;
     const anchor = entry.anchorId !== undefined ? entries.get(entry.anchorId) : undefined;
     if (!anchor) {
@@ -473,7 +636,7 @@ export function createGraphRenderer(
       return;
     }
     if (anchor.node.layer === "spider") placeSpider(anchor, time);
-    if (!anchor.mesh.visible) {
+    if (!anchor.mesh?.visible) {
       spiderVisible(entry, false);
       return;
     }
@@ -502,6 +665,7 @@ export function createGraphRenderer(
         z = tween.from.z + (z - tween.from.z) * s;
       }
     }
+    if (entry.sim.x !== x || entry.sim.y !== y || entry.sim.z !== z) spiderMoved = true;
     entry.sim.x = x;
     entry.sim.y = y;
     entry.sim.z = z;
@@ -509,11 +673,12 @@ export function createGraphRenderer(
 
   /** Spider anchor moved in the model: remember where it is now and slide to the new slot. */
   function retargetSpider(entry: NodeEntry, now: number): void {
-    if (entry.sim.x !== undefined && entry.mesh.visible) {
+    if (entry.sim.x !== undefined && entry.mesh?.visible) {
       entry.tween = { from: { x: entry.sim.x, y: entry.sim.y ?? 0, z: entry.sim.z ?? 0 }, start: now };
     }
     entry.anchorId = entry.node.anchorId;
     rebuildAnchorIndex();
+    rebuildClusters();
   }
 
   // ---- node visuals --------------------------------------------------------------------------
@@ -526,7 +691,7 @@ export function createGraphRenderer(
   }
 
   function refreshLabel(entry: NodeEntry): void {
-    if (!labelVisible(entry)) {
+    if (!entry.mesh || !labelVisible(entry)) {
       if (entry.label) entry.label.sprite.visible = false;
       return;
     }
@@ -547,6 +712,7 @@ export function createGraphRenderer(
 
   function refreshMaterial(entry: NodeEntry): void {
     const { node, mesh, visual } = entry;
+    if (!mesh) return;
     const color = colorFor(visual.color);
     mesh.material.color.copy(color);
     mesh.material.emissive.copy(color);
@@ -558,7 +724,7 @@ export function createGraphRenderer(
 
   function refreshRing(entry: NodeEntry): void {
     const ref = entry.visual.ring;
-    if (ref === undefined) {
+    if (ref === undefined || !entry.mesh) {
       if (entry.ring) {
         scene.remove(entry.ring);
         entry.ring.material.dispose();
@@ -574,16 +740,60 @@ export function createGraphRenderer(
     entry.ring.scale.setScalar(entry.visual.radius * RING_SCALE);
   }
 
-  /** Re-resolve a node's visual and apply every dependent piece (scale, material, ring, label). */
-  function restyleNode(entry: NodeEntry): void {
+  /** Give a shown node its sphere; web nodes without a position start near an anchor so they do not fly in from the origin. */
+  function mountNode(entry: NodeEntry): void {
+    const { node, sim, visual } = entry;
+    // Without an anchor, leave the position undefined and let d3's deterministic phyllotaxis
+    // placement handle it. Spiders are placed from their anchor every frame.
+    const anchor = node.layer === "web" && sim.x === undefined ? anchorFor(node) : null;
+    if (anchor) {
+      const angle = rng() * Math.PI * 2;
+      const r = SPAWN_RADIUS * (0.5 + rng() * 0.5);
+      sim.x = anchor.x + Math.cos(angle) * r;
+      sim.y = anchor.y + Math.sin(angle) * r;
+      sim.z = mode === "3d-hub" ? anchor.z + (rng() - 0.5) * r : 0;
+    }
+    const mesh = new THREE.Mesh(sphereGeometry, new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.1 }));
+    mesh.scale.setScalar(visual.radius);
+    mesh.userData.id = node.id;
+    scene.add(mesh);
+    entry.mesh = mesh;
+  }
+
+  function unmountNode(entry: NodeEntry): void {
+    if (entry.mesh) {
+      scene.remove(entry.mesh);
+      entry.mesh.material.dispose();
+      entry.mesh = null;
+    }
+    if (entry.ring) {
+      scene.remove(entry.ring);
+      entry.ring.material.dispose();
+      entry.ring = null;
+    }
+    entry.label?.dispose();
+    entry.label = null;
+  }
+
+  /**
+   * Re-resolve a node's visual and apply every dependent piece (scale, material, ring, label).
+   * Returns true when `hidden` flipped: the node entered or left the drawn/simulated set.
+   */
+  function restyleNode(entry: NodeEntry): boolean {
     entry.visual = resolver.nodeVisual(entry.node);
     entry.revision = entry.node.revision;
     entry.sim.radius = entry.visual.radius;
-    entry.mesh.scale.setScalar(entry.visual.radius);
+    const flipped = entry.visual.hidden === (entry.mesh !== null);
+    if (flipped) {
+      if (entry.mesh) unmountNode(entry);
+      else mountNode(entry);
+    }
+    if (entry.mesh) entry.mesh.scale.setScalar(entry.visual.radius);
     refreshMaterial(entry);
     refreshRing(entry);
     refreshLabel(entry);
     if (entry.anchorId !== entry.node.anchorId) retargetSpider(entry, lastFrameTime);
+    return flipped;
   }
 
   /** Where a new node should start: its group node, the centroid of its group, or a connected node. */
@@ -613,50 +823,24 @@ export function createGraphRenderer(
 
   function createEntry(node: GraphNode): NodeEntry {
     const visual = resolver.nodeVisual(node);
-    const sim: SimNode = { id: node.id, radius: visual.radius };
-    // Web nodes start near an anchor so they do not fly in from the origin. Without one, leave the
-    // position undefined and let d3's deterministic phyllotaxis placement handle it. Spiders are
-    // placed from their anchor every frame.
-    const anchor = node.layer === "web" ? anchorFor(node) : null;
-    if (anchor) {
-      const angle = rng() * Math.PI * 2;
-      const r = SPAWN_RADIUS * (0.5 + rng() * 0.5);
-      sim.x = anchor.x + Math.cos(angle) * r;
-      sim.y = anchor.y + Math.sin(angle) * r;
-      sim.z = mode === "3d-hub" ? anchor.z + (rng() - 0.5) * r : 0;
-    }
-    const material = new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.1 });
-    const mesh = new THREE.Mesh(sphereGeometry, material);
-    mesh.scale.setScalar(visual.radius);
-    mesh.userData.id = node.id;
-    scene.add(mesh);
     const entry: NodeEntry = {
       node,
-      sim,
+      sim: { id: node.id, radius: visual.radius, clusterId: ROOT_CLUSTER },
       visual,
       revision: node.revision,
       anchorId: node.anchorId,
       tween: null,
       placedFrame: -1,
-      mesh,
+      mesh: null,
       ring: null,
       label: null,
       labelText: "",
     };
+    if (!visual.hidden) mountNode(entry);
     refreshMaterial(entry);
     refreshRing(entry);
     refreshLabel(entry);
     return entry;
-  }
-
-  function disposeEntry(entry: NodeEntry): void {
-    scene.remove(entry.mesh);
-    entry.mesh.material.dispose();
-    if (entry.ring) {
-      scene.remove(entry.ring);
-      entry.ring.material.dispose();
-    }
-    entry.label?.dispose();
   }
 
   // ---- connectors ----------------------------------------------------------------------------
@@ -666,7 +850,7 @@ export function createGraphRenderer(
   const coneUp = new THREE.Vector3(0, 1, 0);
 
   function refreshCone(entry: ConnectorEntry): void {
-    if (!entry.visual.directed) {
+    if (!entry.visual.directed || !entry.drawn) {
       if (entry.cone) {
         scene.remove(entry.cone);
         entry.cone.material.dispose();
@@ -692,19 +876,28 @@ export function createGraphRenderer(
     return previous.dashed !== entry.visual.dashed;
   }
 
+  /** Hidden endpoints hide a connector entirely; shown web↔web links are simulated as well as drawn. */
+  function classifyConnector(entry: ConnectorEntry): void {
+    const source = entries.get(entry.connector.source);
+    const target = entries.get(entry.connector.target);
+    const shown = source !== undefined && target !== undefined && source.mesh !== null && target.mesh !== null;
+    const web = shown && source.node.layer === "web" && target.node.layer === "web";
+    entry.simulated = web;
+    entry.drawn = shown && (web || entry.connector.kind !== "contains");
+    refreshCone(entry);
+  }
+
   function createConnectorEntry(connector: Connector, source: NodeEntry, target: NodeEntry): ConnectorEntry {
-    const visual = resolver.connectorVisual(connector);
-    const web = source.node.layer === "web" && target.node.layer === "web";
     const entry: ConnectorEntry = {
       connector,
       link: { id: connector.id, kind: connector.kind, distance: connector.distance, source: source.sim, target: target.sim },
-      simulated: web,
-      drawn: web || connector.kind !== "contains",
-      visual,
+      simulated: false,
+      drawn: false,
+      visual: resolver.connectorVisual(connector),
       revision: connector.revision,
       cone: null,
     };
-    refreshCone(entry);
+    classifyConnector(entry);
     return entry;
   }
 
@@ -795,9 +988,154 @@ export function createGraphRenderer(
   /** Rebuild what depends on the set of drawn objects without touching the web simulation. */
   function refreshDrawables(): void {
     meshes = [];
-    for (const e of entries.values()) meshes.push(e.mesh);
+    for (const e of entries.values()) if (e.mesh) meshes.push(e.mesh);
+    for (const e of connectorEntries.values()) classifyConnector(e);
     rebuildAnchorIndex();
+    rebuildClusters();
     rebuildLineBuffers();
+  }
+
+  // ---- cluster hulls -------------------------------------------------------------------------
+  const clusterDrawables = new Map<string, ClusterDrawable>();
+  /** Hull geometry follows positions; refreshed only on frames where something moved (or the set/style changed). */
+  let hullsDirty = true;
+
+  function createClusterDrawable(cluster: Cluster<SimNode>): ClusterDrawable {
+    const flat = mode !== "3d-hub";
+    const fillMaterial = new THREE.MeshBasicMaterial({
+      transparent: true,
+      depthWrite: false,
+      toneMapped: false,
+      side: flat ? THREE.DoubleSide : THREE.BackSide,
+    });
+    let drawable: ClusterDrawable;
+    if (flat) {
+      // Hull as a triangle fan (convex, so vertex 0 fans the whole polygon) over a shared position
+      // attribute; both draw ranges follow the vertex count from `clusterHull2d`.
+      const capacity = cluster.extent.length * HULL_SAMPLES;
+      const positions = new Float32Array(capacity * 3);
+      const positionAttribute = new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage);
+      const index = new Uint32Array(Math.max(0, capacity - 2) * 3);
+      for (let i = 0; i + 2 < capacity; i++) {
+        index[i * 3 + 1] = i + 1;
+        index[i * 3 + 2] = i + 2;
+      }
+      const fillGeometry = new THREE.BufferGeometry();
+      fillGeometry.setAttribute("position", positionAttribute);
+      fillGeometry.setIndex(new THREE.BufferAttribute(index, 1));
+      const outlineGeometry = new THREE.BufferGeometry();
+      outlineGeometry.setAttribute("position", positionAttribute);
+      const outline = new THREE.LineLoop(
+        outlineGeometry,
+        new THREE.LineBasicMaterial({ transparent: true, depthWrite: false, toneMapped: false }),
+      );
+      outline.position.z = -HULL_Z / 2;
+      outline.frustumCulled = false;
+      outline.renderOrder = -1;
+      scene.add(outline);
+      drawable = {
+        cluster,
+        fill: new THREE.Mesh(fillGeometry, fillMaterial),
+        outline,
+        wire: null,
+        hull: new Float32Array(capacity * 2),
+        positions,
+      };
+    } else {
+      const wire = new THREE.Mesh(
+        sphereGeometry,
+        new THREE.MeshBasicMaterial({ wireframe: true, transparent: true, depthWrite: false, toneMapped: false }),
+      );
+      wire.frustumCulled = false;
+      wire.renderOrder = -1;
+      scene.add(wire);
+      drawable = {
+        cluster,
+        fill: new THREE.Mesh(sphereGeometry, fillMaterial),
+        outline: null,
+        wire,
+        hull: new Float32Array(0),
+        positions: new Float32Array(0),
+      };
+    }
+    drawable.fill.frustumCulled = false;
+    drawable.fill.renderOrder = -1;
+    scene.add(drawable.fill);
+    restyleClusterDrawable(drawable);
+    return drawable;
+  }
+
+  function disposeClusterDrawable(drawable: ClusterDrawable): void {
+    scene.remove(drawable.fill);
+    drawable.fill.material.dispose();
+    if (drawable.outline) {
+      // Flat hulls own their geometry; 3D hulls share `sphereGeometry` with the nodes.
+      drawable.fill.geometry.dispose();
+      scene.remove(drawable.outline);
+      drawable.outline.geometry.dispose();
+      drawable.outline.material.dispose();
+    }
+    if (drawable.wire) {
+      scene.remove(drawable.wire);
+      drawable.wire.material.dispose();
+    }
+  }
+
+  /** One drawable per non-root cluster, matching the current mode's geometry; called whenever clusters or mode change. */
+  function rebuildClusterDrawables(): void {
+    for (const drawable of clusterDrawables.values()) disposeClusterDrawable(drawable);
+    clusterDrawables.clear();
+    for (const cluster of clusters) {
+      if (cluster.id === ROOT_CLUSTER || cluster.members.length === 0) continue;
+      clusterDrawables.set(cluster.id, createClusterDrawable(cluster));
+    }
+    hullsDirty = true;
+  }
+
+  function restyleClusterDrawable(drawable: ClusterDrawable): void {
+    const color = colorFor(clusterStyle.color);
+    drawable.fill.material.color.copy(color);
+    drawable.fill.material.opacity = clusterStyle.opacity;
+    drawable.fill.visible = clusterStyle.show;
+    if (drawable.outline) {
+      drawable.outline.material.color.copy(color);
+      drawable.outline.material.opacity = Math.min(1, clusterStyle.opacity * HULL_OUTLINE_OPACITY);
+      drawable.outline.visible = clusterStyle.show;
+    }
+    if (drawable.wire) {
+      drawable.wire.material.color.copy(color);
+      drawable.wire.material.opacity = clusterStyle.opacity * HULL_WIRE_OPACITY;
+      drawable.wire.visible = clusterStyle.show;
+    }
+  }
+
+  /** Refit every hull to its cluster's current positions (after the tick and spider placement). */
+  function updateClusterHulls(): void {
+    const padding = clusterStyle.padding;
+    for (const drawable of clusterDrawables.values()) {
+      const { cluster, fill, outline, wire } = drawable;
+      if (outline) {
+        const count = clusterHull2d(cluster, padding, drawable.hull);
+        const { hull, positions } = drawable;
+        for (let i = 0; i < count; i++) {
+          positions[i * 3] = hull[i * 2];
+          positions[i * 3 + 1] = hull[i * 2 + 1];
+          positions[i * 3 + 2] = HULL_Z;
+        }
+        const attribute = fill.geometry.getAttribute("position");
+        if (attribute) attribute.needsUpdate = true;
+        fill.geometry.setDrawRange(0, Math.max(0, count - 2) * 3);
+        outline.geometry.setDrawRange(0, count);
+        fill.visible = outline.visible = clusterStyle.show && count >= 3;
+      } else if (wire) {
+        measureCluster(cluster, padding, "xyz");
+        fill.visible = wire.visible = clusterStyle.show && cluster.r > 0;
+        fill.position.set(cluster.x, cluster.y, cluster.z);
+        fill.scale.setScalar(cluster.r);
+        wire.position.copy(fill.position);
+        wire.scale.setScalar(cluster.r);
+      }
+    }
   }
 
   // ---- model subscription --------------------------------------------------------------------
@@ -817,7 +1155,7 @@ export function createGraphRenderer(
         if (change.op === "remove") {
           const entry = entries.get(change.id);
           if (!entry) continue;
-          disposeEntry(entry);
+          unmountNode(entry);
           entries.delete(change.id);
           if (change.id === selectedId) setSelected(null);
           if (change.id === hoveredId) setHovered(null);
@@ -829,7 +1167,10 @@ export function createGraphRenderer(
         if (!node) continue;
         const existing = entries.get(change.id);
         if (existing) {
-          if (existing.revision !== node.revision) restyleNode(existing);
+          if (existing.revision !== node.revision && restyleNode(existing)) {
+            if (node.layer === "web") structural = true;
+            else drawables = true;
+          }
         } else {
           entries.set(node.id, createEntry(node));
           if (node.layer === "web") {
@@ -969,28 +1310,35 @@ export function createGraphRenderer(
     let maxX = -Infinity;
     let maxY = -Infinity;
     let maxZ = -Infinity;
-    const placed: SimNode[] = [];
+    /** Shown nodes (plus label headroom) and visible hulls as spheres to frame. */
+    const spheres: Array<{ x: number; y: number; z: number; r: number }> = [];
     for (const e of entries.values()) {
-      if (!e.mesh.visible || e.sim.x === undefined) continue;
-      placed.push(e.sim);
-      const x = e.sim.x;
-      const y = e.sim.y ?? 0;
-      const z = e.sim.z ?? 0;
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-      if (z < minZ) minZ = z;
-      if (z > maxZ) maxZ = z;
+      if (!e.mesh?.visible || e.sim.x === undefined) continue;
+      spheres.push({ x: e.sim.x, y: e.sim.y ?? 0, z: e.sim.z ?? 0, r: e.sim.radius + LABEL_WORLD_HEIGHT });
     }
-    if (placed.length === 0) return;
+    if (clusterStyle.show) {
+      const axes: ClusterAxes = mode === "3d-hub" ? "xyz" : "xy";
+      for (const { cluster } of clusterDrawables.values()) {
+        measureCluster(cluster, clusterStyle.padding, axes);
+        if (cluster.r > 0) spheres.push({ x: cluster.x, y: cluster.y, z: cluster.z, r: cluster.r });
+      }
+    }
+    if (spheres.length === 0) return;
+    for (const s of spheres) {
+      if (s.x - s.r < minX) minX = s.x - s.r;
+      if (s.x + s.r > maxX) maxX = s.x + s.r;
+      if (s.y - s.r < minY) minY = s.y - s.r;
+      if (s.y + s.r > maxY) maxY = s.y + s.r;
+      if (s.z - s.r < minZ) minZ = s.z - s.r;
+      if (s.z + s.r > maxZ) maxZ = s.z + s.r;
+    }
     fitCenter.set((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2);
     let radius = 1;
-    for (const n of placed) {
-      const dx = (n.x ?? 0) - fitCenter.x;
-      const dy = (n.y ?? 0) - fitCenter.y;
-      const dz = (n.z ?? 0) - fitCenter.z;
-      const r = Math.sqrt(dx * dx + dy * dy + dz * dz) + n.radius + LABEL_WORLD_HEIGHT;
+    for (const s of spheres) {
+      const dx = s.x - fitCenter.x;
+      const dy = s.y - fitCenter.y;
+      const dz = s.z - fitCenter.z;
+      const r = Math.sqrt(dx * dx + dy * dy + dz * dz) + s.r;
       if (r > radius) radius = r;
     }
     radius *= FIT_MARGIN;
@@ -1021,18 +1369,25 @@ export function createGraphRenderer(
   renderer.setAnimationLoop((time: number) => {
     frame++;
     lastFrameTime = time;
+    let ticked = false;
     if (simulation.alpha() >= ALPHA_MIN) {
       simulation.tick();
+      ticked = true;
     } else if (fitPending) {
       fitPending = false;
       fit();
     }
     // Spiders ride on the web: place them after the tick, before anything reads positions.
+    spiderMoved = false;
     for (const entry of entries.values()) if (entry.node.layer === "spider") placeSpider(entry, time);
+    if (clusterStyle.show && (ticked || spiderMoved || hullsDirty)) {
+      updateClusterHulls();
+      hullsDirty = false;
+    }
     const pulse = 1.06 + 0.06 * Math.sin((time / PULSE_PERIOD_MS) * Math.PI * 2);
     for (const entry of entries.values()) {
-      if (!entry.mesh.visible) continue;
       const { sim, mesh, visual } = entry;
+      if (!mesh?.visible) continue;
       const x = sim.x ?? 0;
       const y = sim.y ?? 0;
       const z = sim.z ?? 0;
@@ -1066,14 +1421,17 @@ export function createGraphRenderer(
   const unsubscribe = graph.subscribe(applyChanges);
 
   // ---- handle --------------------------------------------------------------------------------
-  return {
+  const handle: GraphHandle = {
     info,
     graph,
 
     setStyle(style: GraphStyle) {
       resolver = new StyleResolver(style);
       colorCache = new Map();
-      let radiiChanged = false;
+      const previousPadding = clusterStyle.padding;
+      clusterStyle = resolver.clusterVisual();
+      let resimulate = previousPadding !== clusterStyle.padding;
+      let drawablesChanged = false;
       let batchesChanged = false;
       for (const entry of entries.values()) {
         const previousRadius = entry.visual.radius;
@@ -1082,21 +1440,29 @@ export function createGraphRenderer(
           entry.label.dispose();
           entry.label = null;
         }
-        restyleNode(entry);
-        if (entry.node.layer === "web" && previousRadius !== entry.visual.radius) radiiChanged = true;
+        const flipped = restyleNode(entry);
+        if (entry.node.layer === "web") {
+          // Collision radii and the shown set feed the simulation; let it settle again.
+          if (flipped || previousRadius !== entry.visual.radius) resimulate = true;
+        } else if (flipped) {
+          drawablesChanged = true;
+        }
       }
       for (const entry of connectorEntries.values()) {
         if (restyleConnector(entry)) batchesChanged = true;
       }
-      if (radiiChanged) {
-        // Collision radii feed the simulation; let it settle again with the new sizes.
+      if (resimulate) {
         syncSimulation();
         simulation.alpha(Math.max(simulation.alpha(), 0.3));
+      } else if (drawablesChanged) {
+        refreshDrawables();
       } else if (batchesChanged) {
         rebuildLineBuffers();
       } else {
         refreshLineColors();
       }
+      for (const drawable of clusterDrawables.values()) restyleClusterDrawable(drawable);
+      hullsDirty = true;
     },
 
     setMode(next: GraphMode) {
@@ -1113,6 +1479,7 @@ export function createGraphRenderer(
       simulation.nodes(nodeList);
       enforceDimensions();
       configureForces();
+      rebuildClusterDrawables();
       simulation.alpha(1);
       // Frame the current positions now so the new camera is sane, and again once the layout settles.
       fit();
@@ -1159,8 +1526,10 @@ export function createGraphRenderer(
       canvas.removeEventListener("pointerleave", onPointerLeave);
       listeners.clear();
       controls.dispose();
-      for (const entry of entries.values()) disposeEntry(entry);
+      for (const entry of entries.values()) unmountNode(entry);
       for (const entry of connectorEntries.values()) disposeConnectorEntry(entry);
+      for (const drawable of clusterDrawables.values()) disposeClusterDrawable(drawable);
+      clusterDrawables.clear();
       entries.clear();
       connectorEntries.clear();
       sphereGeometry.dispose();
@@ -1174,4 +1543,6 @@ export function createGraphRenderer(
       canvas.remove();
     },
   };
+  // Non-contract debug hook: overlapping cluster pairs under the current mode's measure (0 once contained).
+  return Object.assign(handle, { __debug: { clusterOverlaps } });
 }

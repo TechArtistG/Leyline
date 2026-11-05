@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { Connector } from "./connector";
 import type { GraphNode } from "./node";
-import type { ColorRef, ConnectorVisual, NodeVisual } from "./visual";
+import type { ColorRef, ConnectorVisual, LabelSettings, NodeVisual } from "./visual";
 import type { ConnectorKind, NodeKind } from "./wire";
 
 /**
@@ -16,6 +16,12 @@ const ColorRefSchema: z.ZodType<ColorRef> = z.union([
   z.custom<`#${string}`>((v) => typeof v === "string" && HEX_COLOR.test(v), "hex colour"),
 ]);
 
+export const LABEL_ANCHORS = ["above", "below", "left", "right"] as const;
+export type LabelAnchor = (typeof LABEL_ANCHORS)[number];
+
+/** Priority tiers for label level-of-detail; lower tier = shown first when zoomed out. */
+export const LABEL_TIERS = ["project", "all"] as const;
+export type LabelTier = (typeof LABEL_TIERS)[number];
 const NodeStyle = z.object({
   /** Multiplier on the kind's default radius. */
   size: z.number().positive().optional(),
@@ -24,6 +30,12 @@ const NodeStyle = z.object({
   pulse: z.boolean().optional(),
   ring: ColorRefSchema.nullable().optional(),
   labelAlways: z.boolean().optional(),
+  /** Screen-space side of the node the label sits on. Overrides `labels.anchor`. */
+  labelAnchor: z.enum(LABEL_ANCHORS).optional(),
+  /** `project` labels survive zooming out; `all` labels appear past `labels.lod.allAbovePxPerUnit`. */
+  labelTier: z.enum(LABEL_TIERS).optional(),
+  /** Not drawn, not simulated; incident connectors are hidden too. */
+  hidden: z.boolean().optional(),
 });
 export type NodeStyle = z.infer<typeof NodeStyle>;
 
@@ -50,18 +62,43 @@ export const GraphStyle = z.object({
   connectors: z.record(z.string(), ConnectorRule).optional(),
   labels: z
     .object({
+      /** Base screen-space size; labels never render smaller than this. */
       fontSizePx: z.number().positive().optional(),
+      /** Labels grow with zoom up to this screen-space size. */
+      maxFontSizePx: z.number().positive().optional(),
       color: ColorRefSchema.optional(),
+      anchor: z.enum(LABEL_ANCHORS).optional(),
+      /** Screen-space gap between the node's silhouette and the label. */
+      offsetPx: z.number().min(0).optional(),
+      lod: z
+        .object({
+          /** Pixels one world unit occupies on screen; below this only `project`-tier labels show. */
+          allAbovePxPerUnit: z.number().positive().optional(),
+          /** Pixels per world unit at which labels are exactly `fontSizePx`; scale grows linearly from here. */
+          referencePxPerUnit: z.number().positive().optional(),
+        })
+        .optional(),
+    })
+    .optional(),
+  /** Per-project containment: hull outline (2D) / bounding sphere (3D) drawn around each repo's nodes. */
+  clusters: z
+    .object({
+      show: z.boolean().optional(),
+      color: ColorRefSchema.optional(),
+      opacity: z.number().min(0).max(1).optional(),
+      /** World units of free space kept around each cluster's hull. */
+      padding: z.number().min(0).optional(),
     })
     .optional(),
 });
 export type GraphStyle = z.infer<typeof GraphStyle>;
 
 export const DEFAULT_STYLE: GraphStyle = {
+  clusters: { show: true, color: "border", opacity: 0.25, padding: 2 },
   nodes: {
-    universe: { color: "border", emissive: 0.2, labelAlways: true },
-    host: { color: "muted", labelAlways: true },
-    repo: { color: "muted", labelAlways: true },
+    universe: { color: "border", emissive: 0.2, labelAlways: true, labelTier: "project" },
+    host: { color: "muted", labelAlways: true, labelTier: "project" },
+    repo: { color: "muted", labelAlways: true, labelTier: "project" },
     branch: { color: "border", labelAlways: false },
     worktree: {
       color: "muted",
@@ -92,7 +129,7 @@ export const DEFAULT_STYLE: GraphStyle = {
         canceled: { color: "border", emissive: 0 },
       },
     },
-    file: { color: "foreground" },
+    file: { color: "foreground", hidden: true },
     pr: {
       color: "foreground",
       states: {
@@ -115,7 +152,14 @@ export const DEFAULT_STYLE: GraphStyle = {
     },
     "shares-context": { color: "accent", opacity: 0.9, dashed: true },
   },
-  labels: { fontSizePx: 13, color: "foreground" },
+  labels: {
+    fontSizePx: 13,
+    maxFontSizePx: 22,
+    color: "foreground",
+    anchor: "above",
+    offsetPx: 4,
+    lod: { allAbovePxPerUnit: 14, referencePxPerUnit: 14 },
+  },
 };
 
 export function parseGraphStyle(input: unknown): GraphStyle {
@@ -138,6 +182,9 @@ export class StyleResolver {
       pulse: merged.pulse ?? false,
       ring: merged.ring ?? undefined,
       labelAlways: merged.labelAlways ?? false,
+      labelAnchor: merged.labelAnchor ?? this.labels().anchor,
+      labelTier: merged.labelTier ?? "all",
+      hidden: merged.hidden ?? false,
     };
   }
 
@@ -155,11 +202,31 @@ export class StyleResolver {
     };
   }
 
+  /** Fully-resolved global label settings. */
+  labels(): LabelSettings {
+    const d = DEFAULT_STYLE.labels!;
+    const s = this.style.labels ?? {};
+    return {
+      fontSizePx: s.fontSizePx ?? d.fontSizePx!,
+      maxFontSizePx: s.maxFontSizePx ?? d.maxFontSizePx!,
+      color: s.color ?? d.color!,
+      anchor: s.anchor ?? d.anchor!,
+      offsetPx: s.offsetPx ?? d.offsetPx!,
+      allAbovePxPerUnit: s.lod?.allAbovePxPerUnit ?? d.lod!.allAbovePxPerUnit!,
+      referencePxPerUnit: s.lod?.referencePxPerUnit ?? d.lod!.referencePxPerUnit!,
+    };
+  }
+
   labelFontSizePx(): number {
-    return this.style.labels?.fontSizePx ?? DEFAULT_STYLE.labels?.fontSizePx ?? 13;
+    return this.labels().fontSizePx;
   }
 
   labelColor(): ColorRef {
-    return this.style.labels?.color ?? "foreground";
+    return this.labels().color;
+  }
+
+  clusterVisual(): { show: boolean; color: ColorRef; opacity: number; padding: number } {
+    const c = { ...DEFAULT_STYLE.clusters, ...this.style.clusters };
+    return { show: c.show ?? true, color: c.color ?? "border", opacity: c.opacity ?? 0.25, padding: c.padding ?? 2 };
   }
 }

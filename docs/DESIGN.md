@@ -23,6 +23,10 @@ Roots: `universe` is the abstract root everything hangs off; each Paseo daemon i
 
 Tree connectors (`TREE_CONNECTOR_KINDS`: `contains`, `spawned`, `branch-of`, `touches`, `merges-into`) define depth for the layered layout; `shares-context` is a pure cross-link.
 
+### Containment
+
+Every project is spatially contained: each web node belongs to one **cluster** — the nearest `repo` reached by walking incoming tree connectors (except `merges-into`; a node with no tree parent, such as a PR, continues through its `group`), or `root` for `universe`/`host`. Spiders take their anchor's cluster; hidden nodes belong to none. `client/renderer/clusters.ts` supplies two forces: `forceCluster` pulls hub-mode members toward their centroid, and `forceClusterCollide` measures each cluster's padded bounding circle/sphere (y-interval in `2d-lr`, where each cluster is also held in its own y band) and pushes clusters apart whenever they come within `CLUSTER_GAP` of touching, with `root` as a fixed obstacle. The hull drawn around each repo cluster (convex hull of padded node circles in 2D, bounding sphere in 3D) is styled by `clusters` in `GraphStyle`; `handle.__debug.clusterOverlaps()` counts intersecting cluster pairs (0 once settled).
+
 ### Style
 
 The look is data, not code. Each node/connector exposes a semantic `styleState` (agent → its state, worktree → `integration` / `dirty`, pr → its state, `merges-into` → `included` / `stale` / `conflicts`, `touches` → `read` / `edit` / `write`); a `GraphStyle` (`shared/model/style.ts`) maps `kind` base rules plus per-state overrides to theme-independent visuals (`NodeVisual`, `ConnectorVisual`). Colours are roles (`accent`, `success`, …) resolved against the Paseo theme, overridable per role via `palette`, or literal hex. `DEFAULT_STYLE` is built in; a project overrides it with `.leyline/style.json` (loaded by the daemon via `loadStyleRpc`, validated, errors surfaced in the panel status line). See `docs/style.example.json`.

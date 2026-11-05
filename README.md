@@ -193,13 +193,15 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the integration-branch model (rebuildab
 - [ ] `shares-context` edges derived from broker calls; node quick-views for `AGENTS.md` / `DESIGN.md` and diffs
 - [ ] Drag-and-drop: task/branch node onto agent node → `workspace.agents.create({ prompt, parent })`
 
-### Phase 4: Code graph & polish
-- [ ] `server/codegraph`: files / symbols / imports per worktree (tree-sitter or LSP client) as an expandable sub-graph
-- [ ] Clustering forces per repo / worktree; LOD for large graphs
+### Phase 4: Polish
+- [x] Per-project containment (cluster forces + non-overlapping hulls); see `docs/DESIGN.md` → Containment
+- [ ] LOD for large graphs
 - [ ] Dark-mode styling, neon/cyan theme, animation (pulse on active agents)
 
-### Later
+### Later (deprioritised)
 - [ ] PR / issue / checks nodes from `githubRuntime`
+- [ ] 3D convex hull mesh per project as the grouping signifier (quickhull over member positions, padded, translucent) in place of the bounding sphere
+- [ ] File-level code graph: `file` nodes and `touches` connectors exist in the model but are hidden by default (`nodes.file.hidden`); a `server/codegraph` extractor (tree-sitter or LSP client) would populate them as an expandable sub-graph. Branches are the finest granularity for now.
 - [ ] VR mode (aspirational): serve the renderer to a WebXR browser; `@react-three/xr` or `VRButton`
 
 ## Open questions
