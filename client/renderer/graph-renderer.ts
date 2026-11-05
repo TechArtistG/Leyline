@@ -478,19 +478,33 @@ export function createGraphRenderer(
       dirs.push(n);
       inradius = unit[i] * n[0] + unit[i + 1] * n[1] + unit[i + 2] * n[2];
     }
-    const copies = [[0, 0, 0], ...dirs.map((d) => d.map((v) => v * inradius * 2))];
+    // Opposite faces are parallel but their pentagons differ by a 36° twist, so each neighbour is
+    // rotated π/5 about its face normal before being pushed out by twice the inradius; its facing
+    // pentagon then lands edge-for-edge on the central one.
     const extent = 1 + inradius * 2 + 1;
     const scale = 1.2 / extent;
-    const positions = new Float32Array(unit.length * copies.length);
-    const outNormals = new Float32Array(normals.length * copies.length);
-    copies.forEach(([ox, oy, oz], c) => {
-      const base = c * unit.length;
+    const count = dirs.length + 1;
+    const positions = new Float32Array(unit.length * count);
+    const outNormals = new Float32Array(normals.length * count);
+    positions.set(unit.map((v) => v * scale), 0);
+    outNormals.set(normals, 0);
+    const rotation = new THREE.Matrix4();
+    const axis = new THREE.Vector3();
+    const p = new THREE.Vector3();
+    dirs.forEach((d, c) => {
+      const base = (c + 1) * unit.length;
+      axis.set(d[0], d[1], d[2]);
+      rotation.makeRotationAxis(axis, Math.PI / 5);
       for (let i = 0; i < unit.length; i += 3) {
-        positions[base + i] = (unit[i] + ox) * scale;
-        positions[base + i + 1] = (unit[i + 1] + oy) * scale;
-        positions[base + i + 2] = (unit[i + 2] + oz) * scale;
+        p.set(unit[i], unit[i + 1], unit[i + 2]).applyMatrix4(rotation).addScaledVector(axis, inradius * 2).multiplyScalar(scale);
+        positions[base + i] = p.x;
+        positions[base + i + 1] = p.y;
+        positions[base + i + 2] = p.z;
+        p.set(normals[i], normals[i + 1], normals[i + 2]).applyMatrix4(rotation);
+        outNormals[base + i] = p.x;
+        outNormals[base + i + 1] = p.y;
+        outNormals[base + i + 2] = p.z;
       }
-      outNormals.set(normals, base);
     });
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
