@@ -1,10 +1,14 @@
+<p align="center">
+  <img src="assets/icon.png" alt="Leyline logo: three nodes joined into a directed L" width="200">
+</p>
+
 # Leyline
 
 **A visual hub for multi-repo, multi-agent development — a [Paseo](https://github.com/getpaseo/paseo) plugin powered by [OMP (oh-my-pi)](https://github.com/can1357/oh-my-pi).**
 
 Leyline renders a live, interactive graph of everything in flight across your projects: repositories, branches, local worktrees, the agents (and their subagents) working in each, the context they share with one another, and the integration points where their work converges. 2D and 3D physics-based views, with VR interaction as a later goal.
 
-> Status: pre-alpha. Investigation complete; no plugin code yet. See [Development Phases](#development-phases).
+> Status: pre-alpha. Plugin scaffold loads in Paseo and renders a three.js WebGL scene; live data not wired yet. See [Development Phases](#development-phases).
 
 ## Why
 
