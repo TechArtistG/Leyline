@@ -445,7 +445,7 @@ class TopologyBuilder implements TopologyHandle {
         const worktreeId = node({
           id: `wt:${workspace.id}`,
           kind: "worktree",
-          label: workspace.name,
+        label: workspace.title ?? basename(workspace.workspaceDirectory),
           group: repoId,
           weight: 1,
           repoId,
@@ -475,7 +475,7 @@ class TopologyBuilder implements TopologyHandle {
           const worktreeId = node({
             id,
             kind: "worktree",
-            label: worktree.branch ?? basename(worktree.path),
+            label: basename(worktree.path),
             group: repoId,
             weight: 1,
             repoId,
@@ -525,7 +525,7 @@ class TopologyBuilder implements TopologyHandle {
         });
       };
 
-      // Checked-out branches hang off their worktree; the default branch always hangs off the repo too.
+      // Checked-out branches hang off their worktree; the default branch hangs off the repo only when no checkout has it.
       for (const [name, worktreeId] of checkedOut) link("contains", worktreeId, branchNode(name, 1));
       const branches = (git?.branches ?? []).filter(
         (branch) => options.showOtherBranches || branch.name === git?.defaultBranch || checkedOut.has(branch.name),
@@ -548,7 +548,7 @@ class TopologyBuilder implements TopologyHandle {
               commitsAhead: base.commitsAhead,
             });
           }
-          if (isDefault || (!base && !checkedOut.has(branch.name))) link("branch-of", repoId, branchId);
+          if (!checkedOut.has(branch.name) && (isDefault || !base)) link("branch-of", repoId, branchId);
         }
       }
     }
