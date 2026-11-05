@@ -171,7 +171,7 @@ export const DEFAULT_STYLE: GraphStyle = {
       labelAlways: true,
       states: {
         integration: { ring: "success", color: "foreground" },
-        dirty: { ring: "warning" },
+        dirty: { color: "foreground", lighten: 0.2 },
       },
     },
     agent: {
