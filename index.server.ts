@@ -3,11 +3,13 @@ import { resolve } from "node:path";
 import { listBranchesRpc, loadStyleRpc, rendererReportRpc } from "./shared/contracts";
 import { listBranches, setBranchBase, stripRefPrefix } from "./server/git";
 import { loadStyle } from "./server/style";
+import { leylineSettings } from "./shared/settings";
 
 /** `worktree.create.before` requests carrying a `baseRef`, awaiting their `after` event (keyed by path and branch). */
 const pendingBases: Array<{ path: string; branch: string; baseRef: string }> = [];
 
 export default function contribute(server: PluginServerContext) {
+  server.registerSettings(leylineSettings);
   server.handle(rendererReportRpc, ({ surface, ok, detail }) => {
     console.log(`[leyline] renderer ${ok ? "ok" : "FAILED"} (${surface}): ${detail}`);
     return { received: true as const };

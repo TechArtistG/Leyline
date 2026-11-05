@@ -11,6 +11,7 @@ import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { listBranchesRpc } from "../../shared/contracts";
 import type { Graph } from "../../shared/model/graph";
 import type { AgentState, ConnectorData, NodeData } from "../../shared/model/wire";
+import { LEYLINE_SETTINGS_DEFAULTS, type LeylineSettings } from "../../shared/settings";
 
 /**
  * Live topology: mirrors Paseo's workspace/agent/project directories plus per-repo git data into the
@@ -38,14 +39,29 @@ export interface TopologyOptions {
   scope?: { workspaceId: string };
   /** Latest error summary, or `null` once everything is healthy again. */
   onError?: (error: string | null) => void;
+  /** Initial display options; defaults to `LEYLINE_SETTINGS_DEFAULTS`. Change live with `setOptions`. */
+  options?: Partial<TopologyDisplayOptions>;
 }
+
+/** User-tunable display options (a subset of `LeylineSettings`); changeable live via `setOptions`. */
+export type TopologyDisplayOptions = Pick<
+  LeylineSettings,
+  "showGitOnlyWorktrees" | "showOtherBranches" | "collapseHosts" | "gitRefreshSeconds"
+>;
 
 export interface TopologyHandle {
   /** Releases every Paseo subscription and clears timers. Safe to call twice. */
   stop(): void;
+  /** Applies new display options and recomputes the graph. */
+  setOptions(next: Partial<TopologyDisplayOptions>): void;
 }
 
-const GIT_POLL_MS = 15_000;
+const DEFAULT_DISPLAY_OPTIONS: TopologyDisplayOptions = {
+  showGitOnlyWorktrees: LEYLINE_SETTINGS_DEFAULTS.showGitOnlyWorktrees,
+  showOtherBranches: LEYLINE_SETTINGS_DEFAULTS.showOtherBranches,
+  collapseHosts: LEYLINE_SETTINGS_DEFAULTS.collapseHosts,
+  gitRefreshSeconds: LEYLINE_SETTINGS_DEFAULTS.gitRefreshSeconds,
+};
 const PAGE_LIMIT = 200;
 const PARENT_AGENT_LABEL = "paseo.parent-agent-id";
 const DETACHED = "(detached)";
@@ -106,17 +122,34 @@ class TopologyBuilder implements TopologyHandle {
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   private stopped = false;
 
-  constructor(private readonly opts: TopologyOptions) {}
+  private options: TopologyDisplayOptions;
+
+  constructor(private readonly opts: TopologyOptions) {
+    this.options = { ...DEFAULT_DISPLAY_OPTIONS, ...opts.options };
+  }
 
   start(): void {
-    this.pollTimer = setInterval(() => {
-      for (const root of this.git.keys()) void this.refreshGit(root);
-    }, GIT_POLL_MS);
+    this.armPoll();
     void this.subscribeWorkspaces();
     void this.subscribeAgents();
     void this.subscribeProjects();
     void this.subscribeEvents();
     this.schedule();
+  }
+
+  setOptions(next: Partial<TopologyDisplayOptions>): void {
+    if (this.stopped) return;
+    const previous = this.options;
+    this.options = { ...previous, ...next };
+    if (this.options.gitRefreshSeconds !== previous.gitRefreshSeconds) this.armPoll();
+    this.schedule();
+  }
+
+  private armPoll(): void {
+    clearInterval(this.pollTimer);
+    this.pollTimer = setInterval(() => {
+      for (const root of this.git.keys()) void this.refreshGit(root);
+    }, Math.max(1, this.options.gitRefreshSeconds) * 1000);
   }
 
   stop(): void {
@@ -365,6 +398,7 @@ class TopologyBuilder implements TopologyHandle {
   private recompute(): void {
     if (this.stopped) return;
     const { hostId, hostLabel } = this.opts;
+    const options = this.options;
     const nodes = new Map<string, NodeData>();
     const connectors = new Map<string, ConnectorData>();
     const node = (data: NodeData): string => {
@@ -377,8 +411,11 @@ class TopologyBuilder implements TopologyHandle {
     };
 
     const universeId = node({ id: "universe", kind: "universe", label: "universe" });
-    const hostNodeId = node({ id: `host:${hostId}`, kind: "host", label: hostLabel, serverId: hostId, online: true });
-    link("contains", universeId, hostNodeId);
+    let repoParentId = universeId;
+    if (!options.collapseHosts) {
+      repoParentId = node({ id: `host:${hostId}`, kind: "host", label: hostLabel, serverId: hostId, online: true });
+      link("contains", universeId, repoParentId);
+    }
 
     /** Worktree node id by normalized directory, across all projects (agents are matched by cwd). */
     const worktreeByPath = new Map<string, string>();
@@ -428,7 +465,7 @@ class TopologyBuilder implements TopologyHandle {
         if (branch !== null && !checkedOut.has(branch)) checkedOut.set(branch, worktreeId);
       }
 
-      if (git) {
+      if (git && options.showGitOnlyWorktrees) {
         git.worktrees.forEach((worktree, index) => {
           const key = normalizePath(worktree.path);
           if (claimed.has(key)) return;
@@ -461,15 +498,14 @@ class TopologyBuilder implements TopologyHandle {
         label: project.label,
         group: repoId,
         weight: 1.6,
-        hostId: hostNodeId,
+        hostId: `host:${hostId}`,
         rootPath: project.rootPath,
         remoteUrl,
       });
-      link("contains", hostNodeId, repoId);
+      link("contains", repoParentId, repoId);
 
       const bases = new Map<string, NonNullable<NonNullable<ListBranchesOutput["branches"]>[number]["base"]>>();
       if (git?.branches) for (const branch of git.branches) if (branch.base) bases.set(branch.name, branch.base);
-      const known = new Set<string>(git?.branches?.map((branch) => branch.name) ?? []);
       const branchIds = new Set<string>();
       const branchNode = (name: string, weight: number): string => {
         const id = `branch:${project.id}/${name}`;
@@ -491,8 +527,12 @@ class TopologyBuilder implements TopologyHandle {
 
       // Checked-out branches hang off their worktree; the default branch always hangs off the repo too.
       for (const [name, worktreeId] of checkedOut) link("contains", worktreeId, branchNode(name, 1));
-      if (git?.branches) {
-        for (const branch of git.branches) {
+      const branches = (git?.branches ?? []).filter(
+        (branch) => options.showOtherBranches || branch.name === git?.defaultBranch || checkedOut.has(branch.name),
+      );
+      const known = new Set<string>(branches.map((branch) => branch.name));
+      if (git) {
+        for (const branch of branches) {
           const isDefault = branch.name === git.defaultBranch;
           const base = branch.base && known.has(branch.base.name) ? branch.base : null;
           const branchId = branchNode(branch.name, isDefault ? 1.2 : 0.6);
