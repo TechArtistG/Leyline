@@ -113,7 +113,7 @@ interface NodeEntry {
   /** Spider only: currently drawn as a ring or spoke (its anchor chain resolves to a shown web node); the label needs it. */
   placed: boolean;
   /** Web only; null while hidden. Ring and label follow it. */
-  mesh: Three.Mesh<Three.SphereGeometry, Three.MeshStandardMaterial> | null;
+  mesh: Three.Mesh<Three.BufferGeometry, Three.MeshStandardMaterial> | null;
   ring: Three.Mesh<Three.TorusGeometry, Three.MeshBasicMaterial> | null;
   /** Web: `labelAlways`/LOD or hover/select. Spider: hover/select only, laid out at its ring top or tip. */
   label: Label | null;
@@ -196,7 +196,8 @@ type SpokeLook = SubagentState | "attention" | "idle";
 /**
  * One radial spoke on an agent ring for one subagent or child agent: two parallel dashed lanes
  * from the ring edge to the tip edge (counter-marching while running), ending in a ring tip
- * (dashed + spinning while running). All live in the ring's group.
+ * (dashed + spinning while running). All live in the ring's group. A running tip owns its dashed
+ * `material` so its dash count can follow its on-screen size (`dashes`, see `fitDashes`).
  */
 interface Spoke {
   entry: NodeEntry;
@@ -205,18 +206,23 @@ interface Spoke {
   /** Lane `+` (offset along the spoke's left normal) and lane `−`; each owns its geometry. */
   lanes: readonly [Line2Module.Line2, Line2Module.Line2];
   tip: Line2Module.Line2;
+  material: LineMaterialModule.LineMaterial | null;
+  dashes: number;
 }
 /**
  * One concentric ring around a worktree for one anchored root agent; dashed + spinning while that
  * agent executes. `group` is the ring plane (billboarded in 3D): the ring line, spokes and tips are
- * its children, so the spin never moves the spokes.
+ * its children, so the spin never moves the spokes. `group.scale` is the set's screen-space minimum
+ * size clamp (`updateAgentRings`). An executing ring owns its dashed `material` so its dash count
+ * can follow its on-screen size (`dashes`, see `fitDashes`); others share a solid material.
  */
 interface AgentRing {
   entry: NodeEntry;
-  executing: boolean;
   radius: number;
   group: Three.Group;
   line: Line2Module.Line2;
+  material: LineMaterialModule.LineMaterial | null;
+  dashes: number;
   spokes: Spoke[];
 }
 /** All agent rings of one web node, in sorted root agent id order (index = ring slot from the inside out). */
@@ -226,11 +232,11 @@ interface AgentRingSet {
   key: string;
   rings: AgentRing[];
   /**
-   * Glyph LOD: the inner ring is under `lodRadiusPx` on screen (with `GLYPH_LOD_HYSTERESIS`), so
-   * rings draw solid and still and spokes are hidden. Flipped per frame by `updateAgentRings`;
-   * materials/visibility are swapped only on the flip.
+   * Glyph LOD: the inner ring is under `minRadiusPx × SPOKE_SHOW_SCALE` on screen (with
+   * `GLYPH_LOD_HYSTERESIS`), so spokes and tips are hidden. Flipped per frame by `updateAgentRings`;
+   * visibility changes only on the flip. The rings themselves always draw in their true state.
    */
-  coarse: boolean;
+  spokesHidden: boolean;
 }
 interface Point {
   x: number;
@@ -298,17 +304,23 @@ const DASH_PERIOD = DASH_SIZE + GAP_SIZE;
 const LANE_GAP = 0.12;
 /** Cap on the frame delta fed to the dash march, so a throttled/hidden tab resumes without a jump. */
 const MARCH_DT_MAX = 0.1;
-/** Agent rings: polyline resolution, dash count per executing ring (dash and gap each 1/24 of the circumference). */
+/**
+ * Agent rings: polyline resolution of the shared unit circle, and the adaptive dash count of an
+ * executing ring or running tip: one dash+gap per `RING_DASH_PX` of on-screen circumference,
+ * clamped to `[RING_DASHES_MIN, RING_DASHES_MAX]` (`fitDashes`).
+ */
 const AGENT_RING_SEGMENTS = 64;
-const AGENT_RING_DASHES = 12;
-/** Dash count per running spoke tip: fewer than the ring's so they stay readable at tip size. */
-const TIP_DASHES = 4;
+const RING_DASH_PX = 18;
+const RING_DASHES_MIN = 4;
+const RING_DASHES_MAX = 12;
 /** Spoke lane dash pattern, world units, and the march speed of a running spoke's lanes (units/s, opposite per lane). */
 const SPOKE_LANE_DASH = 0.3;
 const SPOKE_LANE_GAP = 0.2;
 const SPOKE_LANE_PERIOD = SPOKE_LANE_DASH + SPOKE_LANE_GAP;
 const SPOKE_LANE_SPEED = 2;
-/** Glyph LOD band: go coarse below `lodRadiusPx × (1 − h)`, back to full above `lodRadiusPx × (1 + h)`. */
+/** Spokes and tips show only while the inner ring is at least `minRadiusPx × SPOKE_SHOW_SCALE` on screen. */
+const SPOKE_SHOW_SCALE = 1.5;
+/** Spoke LOD band: hide below `threshold × (1 − h)`, show again above `threshold × (1 + h)`. */
 const GLYPH_LOD_HYSTERESIS = 0.1;
 /** Rings draw after the connector batches (also transparent, order 0) so they are never cut by a line. */
 const AGENT_RING_RENDER_ORDER = 1;
@@ -442,6 +454,15 @@ export function createGraphRenderer(
   const hullScene = new THREE.Scene();
 
   const sphereGeometry = new THREE.SphereGeometry(1, 24, 16);
+  const dodecahedronGeometry = new THREE.DodecahedronGeometry(1, 0);
+  const geometryFor = (shape: NodeVisual["shape"]): Three.BufferGeometry =>
+    shape === "dodecahedron" ? dodecahedronGeometry : sphereGeometry;
+  /** Stable hue per label (FNV-1a), tuned for a dark surface. */
+  const labelHashColor = (label: string, out: Three.Color): Three.Color => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < label.length; i++) h = Math.imul(h ^ label.charCodeAt(i), 0x01000193);
+    return out.setHSL(((h >>> 0) % 360) / 360, 0.55, 0.55);
+  };
   const ringGeometry = new THREE.TorusGeometry(1, RING_TUBE, 8, 48);
   const coneGeometry = new THREE.ConeGeometry(CONE_RADIUS, CONE_HEIGHT, 12);
 
@@ -535,11 +556,16 @@ export function createGraphRenderer(
 
   // Agent glyphs (rings, tips): a unit circle polyline shared by every ring and tip (scaled per
   // object; screen-space width is scale-independent). Dash distances are static in the geometry's
-  // unit space, so one dash/gap size tiles every ring regardless of radius. Spoke lanes are
-  // per-spoke segments in world units (`createLane`) with their own dash pattern.
+  // unit space, so a material's dash/gap size tiles the circle with a fixed dash count regardless
+  // of radius; executing rings and running tips own their material and retile it to their on-screen
+  // size (`fitDashes`). Spoke lanes are per-spoke segments in world units (`createLane`) with their
+  // own dash pattern.
   const agentRingGeometry = new LineGeometry();
   const agentRingChord = 2 * Math.sin(Math.PI / AGENT_RING_SEGMENTS);
-  const agentRingDash = (AGENT_RING_SEGMENTS * agentRingChord) / (AGENT_RING_DASHES * 2);
+  /** Length of the unit circle polyline in its dash-distance space (the polygon perimeter). */
+  const agentRingPerimeter = AGENT_RING_SEGMENTS * agentRingChord;
+  /** Dash length of a freshly created ring/tip material: `RING_DASHES_MAX` dashes, retiled on first frame. */
+  const agentRingDash = agentRingPerimeter / (RING_DASHES_MAX * 2);
   {
     const points = new Float32Array((AGENT_RING_SEGMENTS + 1) * 3);
     for (let i = 0; i <= AGENT_RING_SEGMENTS; i++) {
@@ -555,17 +581,16 @@ export function createGraphRenderer(
     }
     attachLineDistances(agentRingGeometry, distances, THREE.StaticDrawUsage);
   }
-  /** Tip dash length in the unit circle's space: `TIP_DASHES` dashes per tip circumference. */
-  const tipDash = agentRingDash * (AGENT_RING_DASHES / TIP_DASHES);
   /** Every glyph material, for the resize/restyle/dispose sweeps that must treat them all alike. */
-  const glyphMaterials: LineMaterialModule.LineMaterial[] = [];
+  const glyphMaterials = new Set<LineMaterialModule.LineMaterial>();
   /**
    * All glyph materials come from here so that solid and dashed variants differ in nothing but
    * `dashed`/`dashSize`/`gapSize`: same `linewidth` (restyled together), `resolution` (resized
-   * together), opacity, `alphaToCoverage`, `dashScale` and depth settings. The only remaining
+   * together), opacity, `alphaToCoverage`, `dashScale` and depth write. Ring materials skip the
+   * depth test so a ring enlarged to `minRadiusPx` always draws over its node. The only remaining
    * difference is in the shader itself, which discards the round endcaps of dashed segments.
    */
-  function createGlyphMaterial(dashed: boolean, dash: number, gap = dash): LineMaterialModule.LineMaterial {
+  function createGlyphMaterial(dashed: boolean, dash: number, gap = dash, depthTest = true): LineMaterialModule.LineMaterial {
     const material = new LineMaterial({
       linewidth: agentRingStyle.width,
       worldUnits: false,
@@ -576,42 +601,63 @@ export function createGraphRenderer(
       opacity: 1,
       transparent: true,
       alphaToCoverage: true,
-      depthTest: true,
+      depthTest,
       depthWrite: false,
       toneMapped: false,
     });
     material.resolution.set(width, height);
-    glyphMaterials.push(material);
+    glyphMaterials.add(material);
     return material;
   }
-  /** Agent ring materials indexed `[selected ? 1 : 0][executing ? 1 : 0]`; selected ones are `selection.widthScale` wider. */
-  const ringMaterials = [
-    [createGlyphMaterial(false, agentRingDash), createGlyphMaterial(true, agentRingDash)],
-    [createGlyphMaterial(false, agentRingDash), createGlyphMaterial(true, agentRingDash)],
+  /** Solid (non-executing) ring materials indexed `[selected ? 1 : 0]`; the selected one is `selection.widthScale` wider. */
+  const solidRingMaterials = [
+    createGlyphMaterial(false, agentRingDash, agentRingDash, false),
+    createGlyphMaterial(false, agentRingDash, agentRingDash, false),
   ];
+  /** Dashed ring material for one executing agent: ring colour, `selection.widthScale` wider while selected. */
+  function createRingMaterial(selected: boolean): LineMaterialModule.LineMaterial {
+    const material = createGlyphMaterial(true, agentRingDash, agentRingDash, false);
+    material.color.copy(solidRingMaterials[0].color);
+    material.linewidth = agentRingStyle.width * (selected ? selectionStyle.widthScale : 1);
+    return material;
+  }
+  /** Dashed tip material for one running subagent: colour from the `running` tip template. */
+  function createTipMaterial(): LineMaterialModule.LineMaterial {
+    const material = createGlyphMaterial(true, agentRingDash);
+    material.color.copy(tipMaterials.running.color);
+    return material;
+  }
   /**
    * Spoke lane materials per look, `[+, −]`: both dashed in world units (lane geometry is in the
    * ring plane at scale 1); the `running` pair is marched in opposite directions each frame.
    */
   const laneMaterials = {} as Record<SpokeLook, readonly [LineMaterialModule.LineMaterial, LineMaterialModule.LineMaterial]>;
-  /** Tip ring per look: dashed (and spun per frame) while running, solid otherwise. */
+  /**
+   * Tip ring per look: solid, shared by every tip of that look. The `running` entry is dashed but
+   * only a template: each running tip owns a copy (`createTipMaterial`) that holds the lightened
+   * ring colour and is retiled to the tip's on-screen size.
+   */
   const tipMaterials = {} as Record<SpokeLook, LineMaterialModule.LineMaterial>;
   for (const look of SPOKE_LOOKS) {
     laneMaterials[look] = [
       createGlyphMaterial(true, SPOKE_LANE_DASH, SPOKE_LANE_GAP),
       createGlyphMaterial(true, SPOKE_LANE_DASH, SPOKE_LANE_GAP),
     ];
-    tipMaterials[look] = createGlyphMaterial(look === "running", tipDash);
+    tipMaterials[look] = createGlyphMaterial(look === "running", agentRingDash);
   }
 
-  /** Apply the agent-ring style (width, colours, selection width) to every glyph material. */
+  /**
+   * Apply the agent-ring style (width, colours) to every glyph material. Per-object materials
+   * (executing rings, running tips) are swept too, then `refreshRingMaterials` restores their
+   * selection width and tip colour.
+   */
   function restyleGlyphMaterials(): void {
     const ringColor = colorFor(agentRingStyle.color);
     for (const material of glyphMaterials) {
       material.linewidth = agentRingStyle.width;
       material.color.copy(ringColor);
     }
-    for (const material of ringMaterials[1]) material.linewidth = agentRingStyle.width * selectionStyle.widthScale;
+    solidRingMaterials[1].linewidth = agentRingStyle.width * selectionStyle.widthScale;
     for (const look of SPOKE_LOOKS) {
       const ref = SPOKE_LOOK_COLOR[look];
       if (ref === null) continue;
@@ -1020,13 +1066,21 @@ export function createGraphRenderer(
     const { node, mesh, visual } = entry;
     if (!mesh) return;
     // `lighten` tints the role colour toward the foreground; base and emissive share the tint.
-    tintColor.copy(colorFor(visual.color)).lerp(foreground, visual.lighten);
+    if (visual.colorByLabel) labelHashColor(node.label, tintColor);
+    else tintColor.copy(colorFor(visual.color));
+    tintColor.lerp(foreground, visual.lighten);
     mesh.material.color.copy(tintColor);
     mesh.material.emissive.copy(tintColor);
     let intensity = visual.emissive;
     if (node.id === selectedId) intensity += SELECT_EMISSIVE;
     if (node.id === hoveredId) intensity += HOVER_EMISSIVE;
     mesh.material.emissiveIntensity = intensity;
+    const geometry = geometryFor(visual.shape);
+    if (mesh.geometry !== geometry) {
+      mesh.geometry = geometry;
+      mesh.material.flatShading = visual.shape !== "sphere";
+      mesh.material.needsUpdate = true;
+    }
   }
 
   function refreshRing(entry: NodeEntry): void {
@@ -1059,7 +1113,10 @@ export function createGraphRenderer(
       sim.y = anchor.y + Math.sin(angle) * r;
       sim.z = mode === "3d-hub" ? anchor.z + (rng() - 0.5) * r : 0;
     }
-    const mesh = new THREE.Mesh(sphereGeometry, new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.1 }));
+    const mesh = new THREE.Mesh(
+      geometryFor(visual.shape),
+      new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.1, flatShading: visual.shape !== "sphere" }),
+    );
     mesh.scale.setScalar(visual.radius);
     mesh.userData.id = node.id;
     scene.add(mesh);
@@ -1403,13 +1460,21 @@ export function createGraphRenderer(
   function disposeAgentRingSet(set: AgentRingSet): void {
     for (const ring of set.rings) {
       scene.remove(ring.group);
+      if (ring.material) disposeGlyphMaterial(ring.material);
       for (const spoke of ring.spokes) {
         spoke.lanes[0].geometry.dispose();
         spoke.lanes[1].geometry.dispose();
+        if (spoke.material) disposeGlyphMaterial(spoke.material);
         unplace(spoke.entry);
       }
       unplace(ring.entry);
     }
+  }
+
+  /** Drop a per-object glyph material (executing ring, running tip) from the sweeps and the GPU. */
+  function disposeGlyphMaterial(material: LineMaterialModule.LineMaterial): void {
+    glyphMaterials.delete(material);
+    material.dispose();
   }
 
   function agentRingRadius(anchor: NodeEntry, slot: number): number {
@@ -1484,10 +1549,6 @@ export function createGraphRenderer(
     }
   }
 
-  function ringMaterial(agentId: string, executing: boolean): LineMaterialModule.LineMaterial {
-    return ringMaterials[agentId === selectedId ? 1 : 0][executing ? 1 : 0];
-  }
-
   /**
    * Reconcile the ring sets with the anchored-spider index: one set per shown web node that has
    * anchored `agent` spiders, one ring per root agent (`rootAgent`) in sorted id order, concentric
@@ -1521,7 +1582,7 @@ export function createGraphRenderer(
         const existing = agentRingSets.get(anchorId);
         if (existing && existing.entry === anchor && existing.key === key) continue;
         if (existing) disposeAgentRingSet(existing);
-        agentRingSets.set(anchorId, createAgentRingSet(anchor, spiderIds, key, spokeLength, tipRadius, existing?.coarse ?? false));
+        agentRingSets.set(anchorId, createAgentRingSet(anchor, spiderIds, key, spokeLength, tipRadius, existing?.spokesHidden ?? false));
       }
     }
     for (const [anchorId, set] of agentRingSets) {
@@ -1532,34 +1593,34 @@ export function createGraphRenderer(
     rebuildPickables();
   }
 
-  /** Build the set for `anchor` (`anchorAgents` indexed for `spiderIds` by the caller), inheriting the LOD state of the set it replaces. */
+  /** Build the set for `anchor` (`anchorAgents` indexed for `spiderIds` by the caller), inheriting the spoke LOD state of the set it replaces. */
   function createAgentRingSet(
     anchor: NodeEntry,
     spiderIds: string[],
     key: string,
     spokeLength: number,
     tipRadius: number,
-    coarse: boolean,
+    spokesHidden: boolean,
   ): AgentRingSet {
-    const set: AgentRingSet = { entry: anchor, key, rings: [], coarse };
+    const set: AgentRingSet = { entry: anchor, key, rings: [], spokesHidden };
     for (const id of spiderIds) {
       const agent = agentSpider(id);
       if (!agent || rootAgent(agent) !== agent) continue;
-      const executing = (agent.node as AgentNode).state === "executing";
+      const material = (agent.node as AgentNode).state === "executing" ? createRingMaterial(id === selectedId) : null;
       const radius = agentRingRadius(anchor, set.rings.length);
       const group = new THREE.Group();
-      const line = new Line2(agentRingGeometry, ringMaterial(id, executing && !coarse));
+      const line = new Line2(agentRingGeometry, material ?? solidRingMaterials[id === selectedId ? 1 : 0]);
       line.frustumCulled = false;
       line.renderOrder = AGENT_RING_RENDER_ORDER;
       line.scale.setScalar(radius);
       line.userData.id = id;
       group.add(line);
-      const ring: AgentRing = { entry: agent, executing, radius, group, line, spokes: [] };
+      const ring: AgentRing = { entry: agent, radius, group, line, material, dashes: 0, spokes: [] };
       collectSpokes(agent, spiderIds);
       const slots = Math.max(spokeEntries.length, SPOKE_MIN_SLOTS);
       for (let i = 0; i < spokeEntries.length; i++) {
         const spoke = createSpoke(ring, spokeEntries[i], spokeLooks[i], spokeLength, tipRadius, i, slots);
-        setSpokeShown(spoke, !coarse);
+        setSpokeShown(spoke, !spokesHidden);
         ring.spokes.push(spoke);
       }
       scene.add(group);
@@ -1598,14 +1659,15 @@ export function createGraphRenderer(
       createLane(cos, sin, gap, start, end, laneMaterials[look][0]),
       createLane(cos, sin, -gap, start, end, laneMaterials[look][1]),
     ] as const;
-    const tip = new Line2(agentRingGeometry, tipMaterials[look]);
+    const material = look === "running" ? createTipMaterial() : null;
+    const tip = new Line2(agentRingGeometry, material ?? tipMaterials[look]);
     tip.frustumCulled = false;
     tip.renderOrder = AGENT_RING_RENDER_ORDER;
     tip.position.set(cos * outer, sin * outer, 0);
     tip.scale.setScalar(tipRadius);
     tip.userData.id = entry.node.id;
     ring.group.add(lanes[0], lanes[1], tip);
-    return { entry, look, tipRadius, lanes, tip };
+    return { entry, look, tipRadius, lanes, tip, material, dashes: 0 };
   }
 
   /**
@@ -1641,13 +1703,26 @@ export function createGraphRenderer(
     refreshLabel(spoke.entry);
   }
 
-  /** Flip a set's LOD: ring lines swap between the dashed (executing) and solid material; spokes show or hide. */
-  function setRingSetCoarse(set: AgentRingSet, coarse: boolean): void {
-    set.coarse = coarse;
-    for (const ring of set.rings) {
-      ring.line.material = ringMaterial(ring.entry.node.id, ring.executing && !coarse);
-      for (const spoke of ring.spokes) setSpokeShown(spoke, !coarse);
+  /** Flip a set's spoke LOD: spokes and tips show or hide together; the rings are untouched. */
+  function setSpokesShown(set: AgentRingSet, shown: boolean): void {
+    set.spokesHidden = !shown;
+    for (const ring of set.rings) for (const spoke of ring.spokes) setSpokeShown(spoke, shown);
+  }
+
+  /**
+   * Retile a dashed glyph material (executing ring, running tip) to the dash count for its on-screen
+   * radius: `clamp(round(2π·radiusPx / RING_DASH_PX), RING_DASHES_MIN, RING_DASHES_MAX)`, dash and
+   * gap each `perimeter / (2 × count)` in the unit circle's distance space. `dashes` is the count
+   * currently applied; the uniforms are touched only when the integer count changes.
+   */
+  function fitDashes(material: LineMaterialModule.LineMaterial, dashes: number, radiusPx: number): number {
+    const count = Math.min(RING_DASHES_MAX, Math.max(RING_DASHES_MIN, Math.round((Math.PI * 2 * radiusPx) / RING_DASH_PX)));
+    if (count !== dashes) {
+      const dash = agentRingPerimeter / (count * 2);
+      material.dashSize = dash;
+      material.gapSize = dash;
     }
+    return count;
   }
 
   /** Web node meshes first (nearest hit wins), then tips before rings so a tip crossing an outer ring picks as the tip on ties. */
@@ -1660,17 +1735,27 @@ export function createGraphRenderer(
     for (const set of agentRingSets.values()) for (const ring of set.rings) pickables.push(ring.line);
   }
 
-  /** Selection changed: the selected agent's ring takes the wider material, the previous one drops it. */
-  function refreshRingSelection(): void {
+  /**
+   * Selection or style changed: a solid ring takes the shared material for its selection state; an
+   * executing ring's own material takes the matching width; a running tip's own material takes the
+   * (restyled) lightened ring colour.
+   */
+  function refreshRingMaterials(): void {
     for (const set of agentRingSets.values()) {
-      for (const ring of set.rings) ring.line.material = ringMaterial(ring.entry.node.id, ring.executing && !set.coarse);
+      for (const ring of set.rings) {
+        const selected = ring.entry.node.id === selectedId;
+        if (ring.material) ring.material.linewidth = agentRingStyle.width * (selected ? selectionStyle.widthScale : 1);
+        else ring.line.material = solidRingMaterials[selected ? 1 : 0];
+        for (const spoke of ring.spokes) spoke.material?.color.copy(tipMaterials.running.color);
+      }
     }
   }
 
-  /** Style change: shared materials take the new width/colours; radii, spoke scales and `show` go through the reconcile. */
+  /** Style change: shared materials take the new width/colours; radii, spoke scales and `show` go through the reconcile; per-object materials are re-derived. */
   function restyleAgentRings(): void {
     restyleGlyphMaterials();
     rebuildAgentRings();
+    refreshRingMaterials();
   }
 
   /**
@@ -1704,16 +1789,24 @@ export function createGraphRenderer(
   /**
    * Per frame: each ring group follows its node and faces the camera in 3D (flat in 2D); executing
    * ring lines and running tips spin about the ring normal; running tips pulse. Agent labels sit
-   * above the ring's top point, subagent labels at the tip. Glyph LOD per set: the inner ring's
-   * on-screen radius (`unitPx`, divided by view depth under perspective as for labels) against
-   * `lodRadiusPx` with `GLYPH_LOD_HYSTERESIS`; flips go through `setRingSetCoarse` so materials
-   * and visibility change only then.
+   * above the ring's top point, subagent labels at the tip.
+   *
+   * Screen-space minimum: the inner ring's on-screen radius (`unitPx`, divided by view depth under
+   * perspective as for labels) is held at `minRadiusPx` or more by scaling the whole set
+   * (`group.scale = minRadiusPx / innerPx` when under, else 1), so concentric rings keep their
+   * spacing ratio and an executing ring stays visibly dashed and spinning at any zoom. Executing
+   * rings and running tips retile their dashes to their clamped on-screen size (`fitDashes`).
+   * Spoke LOD per set: spokes and tips hide while the (unclamped) inner ring is under
+   * `minRadiusPx × SPOKE_SHOW_SCALE` with `GLYPH_LOD_HYSTERESIS`; flips go through
+   * `setSpokesShown` so visibility changes only then. Spokes are only ever shown at scale 1, since
+   * that band lies above `minRadiusPx`.
    */
   function updateAgentRings(time: number, perspective: boolean, unitPx: number): void {
     const spin = ((time / 1000) * agentRingStyle.rotateDegPerSec * THREE.MathUtils.DEG2RAD) % (Math.PI * 2);
     const billboard = mode === "3d-hub";
     const tipPulse = 1 + TIP_PULSE * (0.5 + 0.5 * Math.sin((time / PULSE_PERIOD_MS) * Math.PI * 2));
-    const lodPx = agentRingStyle.lodRadiusPx;
+    const minPx = agentRingStyle.minRadiusPx;
+    const spokePx = minPx * SPOKE_SHOW_SCALE;
     for (const set of agentRingSets.values()) {
       const { sim } = set.entry;
       const x = sim.x ?? 0;
@@ -1723,26 +1816,32 @@ export function createGraphRenderer(
         ? unitPx / Math.max(-glyphTmp.set(x, y, z).applyMatrix4(camera.matrixWorldInverse).z, 1e-3)
         : unitPx;
       const innerPx = set.rings[0].radius * pxPerUnit;
-      if (set.coarse ? innerPx > lodPx * (1 + GLYPH_LOD_HYSTERESIS) : innerPx < lodPx * (1 - GLYPH_LOD_HYSTERESIS)) {
-        setRingSetCoarse(set, !set.coarse);
+      const scale = innerPx < minPx ? minPx / innerPx : 1;
+      if (set.spokesHidden ? innerPx > spokePx * (1 + GLYPH_LOD_HYSTERESIS) : innerPx < spokePx * (1 - GLYPH_LOD_HYSTERESIS)) {
+        setSpokesShown(set, set.spokesHidden);
       }
-      const coarse = set.coarse;
+      const spokesHidden = set.spokesHidden;
       for (const ring of set.rings) {
         const { group, line } = ring;
         group.position.set(x, y, z);
+        group.scale.setScalar(scale);
         if (billboard) group.quaternion.copy(camera.quaternion);
         else group.quaternion.identity();
-        line.quaternion.setFromAxisAngle(agentRingAxis, ring.executing && !coarse ? spin : 0);
+        if (ring.material) {
+          line.quaternion.setFromAxisAngle(agentRingAxis, spin);
+          ring.dashes = fitDashes(ring.material, ring.dashes, ring.radius * scale * pxPerUnit);
+        }
         if (ring.entry.label?.sprite.visible) {
-          glyphTmp.set(0, ring.radius, 0).applyQuaternion(group.quaternion).add(group.position);
+          glyphTmp.set(0, ring.radius * scale, 0).applyQuaternion(group.quaternion).add(group.position);
           layoutLabel(ring.entry, glyphTmp.x, glyphTmp.y, glyphTmp.z, 0, "above", perspective, unitPx);
         }
-        if (coarse) continue; // spokes hidden and unplaced: nothing to spin, pulse or label
+        if (spokesHidden) continue; // spokes hidden and unplaced: nothing to spin, pulse or label
         for (const spoke of ring.spokes) {
           const { tip } = spoke;
-          if (spoke.look === "running") {
+          if (spoke.material) {
             tip.quaternion.setFromAxisAngle(agentRingAxis, spin);
             tip.scale.setScalar(spoke.tipRadius * tipPulse);
+            spoke.dashes = fitDashes(spoke.material, spoke.dashes, spoke.tipRadius * pxPerUnit);
           }
           if (spoke.entry.label?.sprite.visible) {
             glyphTmp.copy(tip.position).applyQuaternion(group.quaternion).add(group.position);
@@ -2066,7 +2165,7 @@ export function createGraphRenderer(
     }
     // The selected node's connectors change width, hence batch: regroup rather than just recolour.
     rebuildLineBuffers();
-    refreshRingSelection();
+    refreshRingMaterials();
     emit({ type: "select", id });
   }
 
@@ -2363,6 +2462,7 @@ export function createGraphRenderer(
       entries.clear();
       connectorEntries.clear();
       sphereGeometry.dispose();
+      dodecahedronGeometry.dispose();
       ringGeometry.dispose();
       coneGeometry.dispose();
       agentRingGeometry.dispose();

@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { Connector } from "./connector";
 import type { GraphNode } from "./node";
 import type { AgentRingVisual, ColorRef, ConnectorVisual, LabelSettings, NodeVisual } from "./visual";
+import { NODE_SHAPES } from "./visual";
 import type { ConnectorKind, NodeKind } from "./wire";
 
 /**
@@ -31,6 +32,10 @@ const NodeStyle = z.object({
   ring: ColorRefSchema.nullable().optional(),
   /** 0..1 mix of `color` toward `foreground` (a lighter tint of the same role). */
   lighten: z.number().min(0).max(1).optional(),
+  /** Derive the colour from a stable hash of the node's label (one hue per project name); overrides `color`. */
+  colorByLabel: z.boolean().optional(),
+  /** Mesh shape. */
+  shape: z.enum(NODE_SHAPES).optional(),
   labelAlways: z.boolean().optional(),
   /** Screen-space side of the node the label sits on. Overrides `labels.anchor`. */
   labelAnchor: z.enum(LABEL_ANCHORS).optional(),
@@ -132,8 +137,8 @@ export const GraphStyle = z.object({
       spokeTipScale: z.number().positive().optional(),
       /** Half-separation of a spoke's two lanes from its centre line, world units. */
       spokeLaneGap: z.number().positive().optional(),
-      /** On-screen inner ring radius in px below which rings draw solid and still and spokes are hidden (±10 % hysteresis). */
-      lodRadiusPx: z.number().positive().optional(),
+      /** Minimum on-screen inner ring radius in px: a set whose inner ring would be smaller is scaled up to it. Spokes hide below 1.5× this (±10 % hysteresis). */
+      minRadiusPx: z.number().positive().optional(),
       /** 0..1 mix of the ring colour toward `foreground` for a running subagent's tip. */
       spokeLighten: z.number().min(0).max(1).optional(),
     })
@@ -154,13 +159,13 @@ export const DEFAULT_STYLE: GraphStyle = {
     spokeScale: 1.1,
     spokeTipScale: 0.45,
     spokeLaneGap: 0.12,
-    lodRadiusPx: 28,
+    minRadiusPx: 16,
     spokeLighten: 0.35,
   },
   nodes: {
     universe: { color: "border", emissive: 0.2, labelAlways: true, labelTier: "project" },
     host: { color: "muted", labelAlways: true, labelTier: "project" },
-    repo: { color: "muted", labelAlways: true, labelTier: "project" },
+    repo: { color: "muted", colorByLabel: true, labelAlways: true, labelTier: "project" },
     branch: {
       color: "border",
       labelAlways: false,
@@ -168,6 +173,7 @@ export const DEFAULT_STYLE: GraphStyle = {
     },
     worktree: {
       color: "muted",
+      shape: "dodecahedron",
       labelAlways: true,
       states: {
         integration: { ring: "success", color: "foreground" },
@@ -261,6 +267,8 @@ export class StyleResolver {
       labelTier: merged.labelTier ?? "all",
       hidden: merged.hidden ?? false,
       lighten: merged.lighten ?? 0,
+      colorByLabel: merged.colorByLabel ?? false,
+      shape: merged.shape ?? "sphere",
     };
   }
 
@@ -318,7 +326,7 @@ export class StyleResolver {
       spokeScale: r.spokeScale ?? 1.1,
       spokeTipScale: r.spokeTipScale ?? 0.45,
       spokeLaneGap: r.spokeLaneGap ?? 0.12,
-      lodRadiusPx: r.lodRadiusPx ?? 28,
+      minRadiusPx: r.minRadiusPx ?? 16,
       spokeLighten: r.spokeLighten ?? 0.35,
     };
   }

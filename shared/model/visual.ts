@@ -22,7 +22,13 @@ export interface NodeVisual {
   hidden: boolean;
   /** 0..1 mix of `color` toward foreground. */
   lighten: number;
+  /** Colour from a stable hash of the label instead of `color`. */
+  colorByLabel: boolean;
+  shape: NodeShape;
 }
+
+export const NODE_SHAPES = ["sphere", "dodecahedron"] as const;
+export type NodeShape = (typeof NODE_SHAPES)[number];
 
 export interface ConnectorVisual {
   /** Screen-space line width in px. */
@@ -74,8 +80,8 @@ export interface AgentRingVisual {
   spokeTipScale: number;
   /** Half-separation of a spoke's two lanes from its centre line, world units. */
   spokeLaneGap: number;
-  /** On-screen inner ring radius (px) below which rings go solid and still and spokes hide; ±10 % hysteresis. */
-  lodRadiusPx: number;
+  /** Minimum on-screen inner ring radius (px): a smaller set is scaled up to it; spokes hide below 1.5× this (±10 % hysteresis). */
+  minRadiusPx: number;
   /** 0..1 mix of `color` toward foreground for a running subagent's tip. */
   spokeLighten: number;
 }
